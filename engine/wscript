@@ -61,7 +61,33 @@ def options(opt):
 	grp.add_option('--ffmpeg-dir', action = 'store', dest = 'FFMPEG_DIR', default = None,
 		help = 'ffmpeg installation prefix, use instead of pkg-config [default: %(default)s]')
 
+	grp.add_option('--enable-openxr', action = 'store_true', dest = 'OPENXR', default = False,
+		help = 'enable OpenXR VR support, loader is loaded in runtime [default: %(default)s]')
+
+	grp.add_option('--openxr', action = 'store', dest = 'OPENXR_DIR', default = None,
+		help = 'path to OpenXR SDK package (include/ and <arch>/bin/openxr_loader), installs the loader next to the engine [default: %(default)s]')
+
 	opt.load('sdl2')
+
+def find_openxr(conf):
+	includes = []
+	if conf.options.OPENXR_DIR:
+		openxr_dir = os.path.abspath(conf.options.OPENXR_DIR)
+		includes = [os.path.join(openxr_dir, 'include')]
+
+		if conf.env.DEST_OS == 'win32':
+			arch = 'x64' if conf.env.DEST_SIZEOF_VOID_P > 4 else 'Win32'
+			loader = os.path.join(openxr_dir, arch, 'bin', 'openxr_loader.dll')
+			if os.path.isfile(loader):
+				conf.env.OPENXR_LOADER = loader
+
+	conf.check_cc(header_name = 'openxr/openxr.h', includes = includes, msg = 'Checking for OpenXR headers')
+	conf.env.INCLUDES_OPENXR = includes
+	conf.env.OPENXR = True
+	conf.define('XASH_OPENXR', 1)
+
+	if conf.env.OPENXR_LOADER:
+		conf.msg('OpenXR loader to install', conf.env.OPENXR_LOADER)
 
 def find_sdl(conf):
 	err_msg = '%s not available! If you want to build dedicated server, specify --dedicated'
@@ -138,6 +164,9 @@ def configure(conf):
 			conf.check_cfg(package='gio-2.0', uselib_store='GIO', args='--cflags --libs')
 			conf.check_cfg(package='audioresource', uselib_store='AUDIORESOURCE', args='--cflags --libs')
 			conf.check_cfg(package='wayland-client', uselib_store='WAYLAND_CLIENT', args='--cflags --libs')
+
+		if conf.options.OPENXR:
+			find_openxr(conf)
 
 
 	if conf.options.STATIC:
@@ -303,6 +332,11 @@ def build(bld):
 			if bld.env.SAILFISH:
 				source += bld.path.ant_glob('platform/sailfish/*.c')
 				libs += ['GIO', 'AUDIORESOURCE', 'WAYLAND_CLIENT']
+
+			if bld.env.OPENXR:
+				libs += ['OPENXR'] # headers only, the loader is opened in runtime
+				if bld.env.OPENXR_LOADER: # only set for win32 by find_openxr
+					bld.install_files(bld.env.BINDIR, bld.root.find_node(bld.env.OPENXR_LOADER))
 
 		# Android port is linked differently
 		if bld.env.DEST_OS == 'android':

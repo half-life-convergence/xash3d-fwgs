@@ -24,6 +24,9 @@ GNU General Public License for more details.
 #include "vid_common.h"
 #include "pm_local.h"
 #include "multi_emulator.h"
+#if XASH_OPENXR
+#include "vr/vr.h"
+#endif
 
 #define CL_CONNECTION_TIMEOUT 15.0f
 #define CL_CONNECTION_RETRIES 5
@@ -3975,6 +3978,10 @@ void CL_Init( void )
 
 	VID_Init();	// init video
 
+#if XASH_OPENXR
+	VR_Init(); // after VID_Init, the GL context will be needed for the session
+#endif
+
 	// unreliable buffer. unsed for unreliable commands and voice stream
 	MSG_Init( &cls.datagram, "cls.datagram", cls.datagram_buf, sizeof( cls.datagram_buf ));
 
@@ -4029,6 +4036,9 @@ void CL_Shutdown( void )
 		g_fsapi.Delete( "demoheader.tmp" ); // remove tmp file
 	SCR_FreeCinematic (); // release AVI's *after* client.dll because custom renderer may use them
 	S_Shutdown ();
+#if XASH_OPENXR
+	VR_Shutdown (); // before R_Shutdown, the session must go before the GL context
+#endif
 	R_Shutdown ();
 
 	Con_Shutdown ();
