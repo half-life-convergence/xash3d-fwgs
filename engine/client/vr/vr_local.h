@@ -42,6 +42,7 @@ qboolean VR_SessionFocused( void );
 qboolean VR_LoadProc( XrInstance instance, const char *name, PFN_xrVoidFunction *func );
 const char *VR_ResultString( XrResult result );
 float VR_HeadYaw( void ); // degrees, where the head faces in the play space, game convention
+qboolean VR_RightHandAim( vec3_t origin, vec3_t angles ); // the weapon hand in the world (grip position, aim angles in view convention), false if not tracked or vr_handweapon 0
 
 #define VR_LOAD_PROC( name ) VR_LoadProc( VR_GetInstance( ), #name, (PFN_xrVoidFunction *)&p##name )
 
@@ -52,7 +53,7 @@ qboolean VR_InitInput( void ); // after the session exists, attaches the action 
 void VR_ShutdownInput( void );
 void VR_InputProfileChanged( void );
 qboolean VR_GetHandPose( int hand, int which, XrTime time, XrSpace base, XrPosef *out ); // hand 0 left 1 right, which 0 grip 1 aim
-qboolean VR_DebugHands( void ); // vr_debug_hands: fake hands without controllers
+qboolean VR_DebugHands( float *yaw, float *pitch ); // vr_debug_hands "1 [yaw pitch]": fake hands without controllers, the right one turned by yaw/pitch
 
 #define VR_HAND_LEFT  0
 #define VR_HAND_RIGHT 1

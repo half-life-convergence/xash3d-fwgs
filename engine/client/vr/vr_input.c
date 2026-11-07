@@ -40,7 +40,16 @@ static CVAR_DEFINE_AUTO( vr_turnmode, "0", FCVAR_ARCHIVE, "right stick turning: 
 static CVAR_DEFINE_AUTO( vr_snapturn, "45", FCVAR_ARCHIVE, "degrees per snap turn" );
 static CVAR_DEFINE_AUTO( vr_turnspeed, "120", FCVAR_ARCHIVE, "smooth turning speed, degrees per second" );
 static CVAR_DEFINE_AUTO( vr_debug_sticks, "0 0 0 0", 0, "developer: pretend the sticks are at \"left_x left_y right_x right_y\", to test without controllers" );
-static CVAR_DEFINE_AUTO( vr_debug_hands, "0", 0, "developer: fake both hands held level in front of the head (45 cm forward, 20 cm down), to test without controllers" );
+static CVAR_DEFINE_AUTO( vr_debug_hands, "0", 0, "developer: \"1 [yaw pitch]\" fakes both hands held in front of the head (45 cm forward, 20 cm down), the right one turned by yaw/pitch degrees, to test without controllers" );
+
+// Hand aim for the game DLLs. Singleplayer runs client and server in this
+// process, and both DLLs can read engine cvars, so these carry the gun's
+// start point without a protocol or interface change. Written by the engine
+// every command, do not set by hand.
+static CVAR_DEFINE_AUTO( vr_aim_active, "0", 0, "VR: 1 while shots start at the tracked hand (set by the engine)" );
+static CVAR_DEFINE_AUTO( vr_aim_x, "0", 0, "VR: gun start point relative to the player origin (set by the engine)" );
+static CVAR_DEFINE_AUTO( vr_aim_y, "0", 0, "VR: gun start point relative to the player origin (set by the engine)" );
+static CVAR_DEFINE_AUTO( vr_aim_z, "0", 0, "VR: gun start point relative to the player origin (set by the engine)" );
 
 typedef enum
 {
@@ -242,6 +251,10 @@ qboolean VR_InitInput( void )
 	Cvar_RegisterVariable( &vr_turnspeed );
 	Cvar_RegisterVariable( &vr_debug_sticks );
 	Cvar_RegisterVariable( &vr_debug_hands );
+	Cvar_RegisterVariable( &vr_aim_active );
+	Cvar_RegisterVariable( &vr_aim_x );
+	Cvar_RegisterVariable( &vr_aim_y );
+	Cvar_RegisterVariable( &vr_aim_z );
 
 	if( !VR_LoadInputProcs( ))
 		return false;
@@ -343,9 +356,14 @@ qboolean VR_GetHandPose( int hand, int which, XrTime time, XrSpace base, XrPosef
 	return true;
 }
 
-qboolean VR_DebugHands( void )
+qboolean VR_DebugHands( float *yaw, float *pitch )
 {
-	return vr_debug_hands.value != 0.0f;
+	float on = 0.0f, y = 0.0f, p = 0.0f;
+
+	sscanf( vr_debug_hands.string, "%f %f %f", &on, &y, &p );
+	if( yaw ) *yaw = y;
+	if( pitch ) *pitch = p;
+	return on != 0.0f;
 }
 
 void VR_ShutdownInput( void )
@@ -524,6 +542,56 @@ buttons and the move stick. The stick moves where the head faces: the
 head's yaw in the play space is folded in, so "forward" is wherever the
 player looks, whichever way the game body points.
 */
+static void VR_SetAimCvar( convar_t *var, float value )
+{
+	if( var->value != value )
+		Cvar_DirectSetValue( var, value );
+}
+
+/*
+VR_AimFromHand
+
+While the weapon is in the tracked right hand, shots must go where it
+points. The command's view angles are what every weapon fires along
+(pev->v_angle on the server, the event angles on the client) and the VR
+eyes no longer use them, so they become the hand's aim. Movement in the
+command is relative to those angles, so it is turned from the body yaw
+into the new yaw, and walking keeps going where it went. The start point
+is published through the vr_aim_* cvars for GetGunPosition and
+EV_GetGunPosition.
+*/
+static void VR_AimFromHand( usercmd_t *cmd )
+{
+	vec3_t origin, angles;
+	float old_yaw, new_yaw, delta, s, c, f, r;
+
+	if( !VR_RightHandAim( origin, angles ))
+	{
+		VR_SetAimCvar( &vr_aim_active, 0.0f );
+		return;
+	}
+
+	old_yaw = cmd->viewangles[YAW];
+	new_yaw = angles[YAW];
+
+	// same world direction, expressed in the new yaw: rotate (forward, right)
+	// by the yaw difference (yaw grows to the left, right is -left)
+	delta = DEG2RAD( new_yaw - old_yaw );
+	s = sinf( delta );
+	c = cosf( delta );
+	f = cmd->forwardmove;
+	r = cmd->sidemove;
+	cmd->forwardmove = f * c - r * s;
+	cmd->sidemove = f * s + r * c;
+
+	VectorCopy( angles, cmd->viewangles );
+
+	VR_SetAimCvar( &vr_aim_x, origin[0] - cl.simorg[0] );
+	VR_SetAimCvar( &vr_aim_y, origin[1] - cl.simorg[1] );
+	VR_SetAimCvar( &vr_aim_z, origin[2] - cl.simorg[2] );
+	VR_SetAimCvar( &vr_aim_active, 1.0f );
+}
+
 void VR_CreateMove( usercmd_t *cmd )
 {
 	float mx, my, h, dx, dy, fwd, side;
@@ -535,22 +603,25 @@ void VR_CreateMove( usercmd_t *cmd )
 
 	mx = VR_Deadzone( vri.move.x );
 	my = VR_Deadzone( vri.move.y );
-	if( mx == 0.0f && my == 0.0f )
-		return;
+	if( mx != 0.0f || my != 0.0f )
+	{
+		// head forward = (cos h, sin h), head right = (sin h, -cos h) in the
+		// play space, which is the player's frame (X forward, Y left)
+		h = DEG2RAD( VR_HeadYaw( ));
+		dx = my * cosf( h ) + mx * sinf( h );
+		dy = my * sinf( h ) - mx * cosf( h );
 
-	// head forward = (cos h, sin h), head right = (sin h, -cos h) in the
-	// play space, which is the player's frame (X forward, Y left)
-	h = DEG2RAD( VR_HeadYaw( ));
-	dx = my * cosf( h ) + mx * sinf( h );
-	dy = my * sinf( h ) - mx * cosf( h );
+		fwd = Cvar_VariableValue( "cl_forwardspeed" );
+		side = Cvar_VariableValue( "cl_sidespeed" );
+		if( fwd <= 0.0f ) fwd = 400.0f;
+		if( side <= 0.0f ) side = 400.0f;
 
-	fwd = Cvar_VariableValue( "cl_forwardspeed" );
-	side = Cvar_VariableValue( "cl_sidespeed" );
-	if( fwd <= 0.0f ) fwd = 400.0f;
-	if( side <= 0.0f ) side = 400.0f;
+		cmd->forwardmove += dx * fwd;
+		cmd->sidemove += -dy * side; // sidemove is positive to the right
+	}
 
-	cmd->forwardmove += dx * fwd;
-	cmd->sidemove += -dy * side; // sidemove is positive to the right
+	// last: it turns all of the command's movement, keyboard included
+	VR_AimFromHand( cmd );
 }
 
 #endif // XASH_OPENXR

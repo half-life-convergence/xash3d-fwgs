@@ -1140,11 +1140,34 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 	{
 		XrPosef grip, aim;
 		vec3_t dummy;
+		float dyaw, dpitch;
 
-		if( VR_DebugHands( ))
+		if( VR_DebugHands( &dyaw, &dpitch ))
 		{
 			VR_FakeHandPose( hand, &grip );
 			aim = grip;
+
+			if( hand == VR_HAND_RIGHT && ( dyaw || dpitch ))
+			{
+				// turn the fake aim: yaw around up, then pitch around the
+				// aim's own right axis (positive pitch tilts it up, OpenXR style)
+				XrQuaternionf qy, qp, t;
+				const XrQuaternionf *q = &aim.orientation;
+
+				qy.x = 0.0f; qy.y = sinf( DEG2RAD( dyaw ) * 0.5f ); qy.z = 0.0f; qy.w = cosf( DEG2RAD( dyaw ) * 0.5f );
+				qp.x = sinf( DEG2RAD( dpitch ) * 0.5f ); qp.y = 0.0f; qp.z = 0.0f; qp.w = cosf( DEG2RAD( dpitch ) * 0.5f );
+
+				// t = qy * q
+				t.w = qy.w * q->w - qy.x * q->x - qy.y * q->y - qy.z * q->z;
+				t.x = qy.w * q->x + qy.x * q->w + qy.y * q->z - qy.z * q->y;
+				t.y = qy.w * q->y - qy.x * q->z + qy.y * q->w + qy.z * q->x;
+				t.z = qy.w * q->z + qy.x * q->y - qy.y * q->x + qy.z * q->w;
+				// aim = t * qp (local pitch)
+				aim.orientation.w = t.w * qp.w - t.x * qp.x - t.y * qp.y - t.z * qp.z;
+				aim.orientation.x = t.w * qp.x + t.x * qp.w + t.y * qp.z - t.z * qp.y;
+				aim.orientation.y = t.w * qp.y - t.x * qp.z + t.y * qp.w + t.z * qp.x;
+				aim.orientation.z = t.w * qp.z + t.x * qp.y - t.y * qp.x + t.z * qp.w;
+			}
 		}
 		else if( !VR_GetHandPose( hand, VR_POSE_GRIP, vr.display_time, vr.space, &grip )
 			|| !VR_GetHandPose( hand, VR_POSE_AIM, vr.display_time, vr.space, &aim ))
@@ -1771,6 +1794,10 @@ static void VR_Info_f( void )
 			else Con_Printf( "VR: %s hand not tracked\n", hand ? "right" : "left" );
 		}
 		Con_Printf( "VR: weapon model at %.1f %.1f %.1f\n", clgame.viewent.origin[0], clgame.viewent.origin[1], clgame.viewent.origin[2] );
+		Con_Printf( "VR: last command aims %.0f %.0f, body yaw %.0f, gun start %s %.1f %.1f %.1f from the player\n",
+			cl.cmd.viewangles[PITCH], cl.cmd.viewangles[YAW], cl.viewangles[YAW],
+			Cvar_VariableValue( "vr_aim_active" ) ? "at the hand," : "at the eyes,",
+			Cvar_VariableValue( "vr_aim_x" ), Cvar_VariableValue( "vr_aim_y" ), Cvar_VariableValue( "vr_aim_z" ));
 	}
 }
 
@@ -1792,6 +1819,16 @@ qboolean VR_SessionFocused( void )
 float VR_HeadYaw( void )
 {
 	return vr.head_yaw;
+}
+
+qboolean VR_RightHandAim( vec3_t origin, vec3_t angles )
+{
+	if( !vr.running || !vr_handweapon.value || !vr.hand_valid[VR_HAND_RIGHT] || cls.state != ca_active )
+		return false;
+
+	VectorCopy( vr.hand_origin[VR_HAND_RIGHT], origin );
+	VectorCopy( vr.hand_angles[VR_HAND_RIGHT], angles );
+	return true;
 }
 
 qboolean VR_Active( void )
