@@ -40,8 +40,14 @@ void VR_EndFrame( void );
 // SteamVR doesn't throttle xrWaitFrame for frames without layers.
 qboolean VR_PacesFrames( void );
 
+// called by V_RenderView before the desktop pass: draws the 3D view into
+// both eye swapchains through the renderer (RF_EXTERNAL_TARGET)
+struct ref_viewpass_s;
+void VR_RenderEyes( const struct ref_viewpass_s *rvp );
+
 // called by the renderer's buffer swap, before the desktop window swaps:
-// copies the finished frame into the eye swapchains
+// if the eyes weren't rendered this frame (menus, loading), copies the
+// finished desktop frame into them so 2D screens stay visible
 void VR_CopyDesktopToEyes( void );
 
 #endif // XASH_OPENXR

@@ -92,6 +92,7 @@ typedef struct ref_overview_s
 #define RF_DRAW_CUBEMAP	(1<<1)		// special 6x pass to render cubemap\skybox sides
 #define RF_DRAW_OVERVIEW	(1<<2)		// overview mode is active
 #define RF_ONLY_CLIENTDRAW	(1<<3)		// nothing is drawn by the engine except clientDraw functions
+#define RF_EXTERNAL_TARGET	(1<<4)		// draw into the framebuffer the caller bound (VR eye): viewport is in its pixels, no scene target, no time step, no viewmodel events
 
 // intermediate struct for viewpass (or just a single frame)
 typedef struct ref_viewpass_s

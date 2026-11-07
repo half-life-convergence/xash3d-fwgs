@@ -541,7 +541,7 @@ void R_SetupGL( qboolean set_gl_state )
 
 	if( !set_gl_state ) return;
 
-	if( !FBitSet( RI.rvp.flags, RF_DRAW_CUBEMAP ))
+	if( !FBitSet( RI.rvp.flags, RF_DRAW_CUBEMAP|RF_EXTERNAL_TARGET ))
 	{
 		int scene_width, scene_height;
 
@@ -564,8 +564,9 @@ void R_SetupGL( qboolean set_gl_state )
 	}
 	else
 	{
-		// envpass, mirrorpass
-		GL_BindWindowTarget();
+		// envpass, mirrorpass; an external target is already bound by the caller
+		if( !FBitSet( RI.rvp.flags, RF_EXTERNAL_TARGET ))
+			GL_BindWindowTarget();
 		pglViewport( RI.rvp.viewport[0], RI.rvp.viewport[1], RI.rvp.viewport[2], RI.rvp.viewport[3] );
 	}
 
@@ -963,8 +964,9 @@ void R_RenderScene( void )
 	if( !WORLDMODEL && FBitSet( RI.rvp.flags, RF_DRAW_WORLD ))
 		gEngfuncs.Host_Error( "%s: NULL worldmodel\n", __func__ );
 
-	// frametime is valid only for normal pass
-	if( !FBitSet( RI.rvp.flags, RF_DRAW_CUBEMAP ))
+	// frametime is valid only for normal pass, extra passes of the same
+	// frame (VR eyes) must not step particles and animations again
+	if( !FBitSet( RI.rvp.flags, RF_DRAW_CUBEMAP|RF_EXTERNAL_TARGET ))
 		tr.frametime = gp_cl->time -   gp_cl->oldtime;
 	else tr.frametime = 0.0;
 
@@ -1119,7 +1121,7 @@ void R_RenderFrame( const ref_viewpass_t *rvp )
 	}
 
 	tr.fCustomRendering = false;
-	if( !FBitSet( RI.rvp.flags, RF_ONLY_CLIENTDRAW ))
+	if( !FBitSet( RI.rvp.flags, RF_ONLY_CLIENTDRAW|RF_EXTERNAL_TARGET ))
 		R_RunViewmodelEvents();
 
 	tr.realframecount++; // right called after viewmodel events

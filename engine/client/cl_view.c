@@ -21,6 +21,9 @@ GNU General Public License for more details.
 #include "sound.h"
 #include "input.h" // touch
 #include "platform/platform.h" // GL_UpdateSwapInterval
+#if XASH_OPENXR
+#include "vr/vr.h"
+#endif
 
 /*
 ===============
@@ -421,6 +424,13 @@ void V_RenderView( void )
 		{
 			ref.dllFuncs.R_ClearScreen();
 		}
+
+#if XASH_OPENXR
+		// eyes first, so the renderer ends the frame in the desktop view's state;
+		// with a menu up the headset gets the desktop copy instead (VR_CopyDesktopToEyes)
+		if( viewnum == 0 && !FBitSet( rvp.flags, RF_ONLY_CLIENTDRAW ) && !UI_IsVisible( ))
+			VR_RenderEyes( &rvp );
+#endif
 
 		GL_RenderFrame( &rvp );
 		S_UpdateFrame( &rvp );

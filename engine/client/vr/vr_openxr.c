@@ -93,6 +93,10 @@ typedef unsigned char vr_GLboolean;
 #define VR_GL_FRAMEBUFFER_COMPLETE      0x8CD5
 #define VR_GL_COLOR_ATTACHMENT0         0x8CE0
 #define VR_GL_FRAMEBUFFER_SRGB          0x8DB9
+#define VR_GL_FRAMEBUFFER               0x8D40
+#define VR_GL_RENDERBUFFER              0x8D41
+#define VR_GL_DEPTH24_STENCIL8          0x88F0
+#define VR_GL_DEPTH_STENCIL_ATTACHMENT  0x821A
 
 static struct
 {
@@ -106,6 +110,13 @@ static struct
 	vr_GLboolean (APIENTRY *IsEnabled)( vr_GLenum cap );
 	void (APIENTRY *Enable)( vr_GLenum cap );
 	void (APIENTRY *Disable)( vr_GLenum cap );
+	void (APIENTRY *GenRenderbuffers)( int n, vr_GLuint *ids );
+	void (APIENTRY *DeleteRenderbuffers)( int n, const vr_GLuint *ids );
+	void (APIENTRY *BindRenderbuffer)( vr_GLenum target, vr_GLuint id );
+	void (APIENTRY *RenderbufferStorage)( vr_GLenum target, vr_GLenum format, int width, int height );
+	void (APIENTRY *FramebufferRenderbuffer)( vr_GLenum target, vr_GLenum attachment, vr_GLenum rbtarget, vr_GLuint rb );
+	void (APIENTRY *ClearColor)( float r, float g, float b, float a );
+	void (APIENTRY *Clear)( unsigned int mask );
 } vrgl;
 
 static const dllfunc_t openxr_loader_funcs[] =
@@ -155,13 +166,16 @@ static struct
 	XrSwapchainImageOpenGLKHR *images[2];
 	uint32_t    num_images[2];
 	int64_t     swapchain_format;
-	vr_GLuint   fbo; // draw target for copying into swapchain images
+	vr_GLuint   fbo; // draw target for rendering/copying into swapchain images
+	vr_GLuint   depth; // depth+stencil renderbuffer shared by both eyes, stays attached to fbo
 
 	XrView   views[2]; // eye poses and fovs at display_time
 	qboolean views_valid;
 	qboolean eyes_written; // both eye images were filled this frame
 
 	uint32_t frames; // frames submitted since the session began
+	uint32_t frames_rendered; // ... of which the renderer drew the eyes
+	uint32_t frames_copied; // ... of which the eyes got the desktop copy
 	double   begin_time;
 	double   wait_total; // seconds spent blocked in xrWaitFrame
 	double   wait_max;
@@ -482,6 +496,13 @@ static qboolean VR_LoadGL( void )
 		{ "glIsEnabled", (void **)&vrgl.IsEnabled },
 		{ "glEnable", (void **)&vrgl.Enable },
 		{ "glDisable", (void **)&vrgl.Disable },
+		{ "glGenRenderbuffers", (void **)&vrgl.GenRenderbuffers },
+		{ "glDeleteRenderbuffers", (void **)&vrgl.DeleteRenderbuffers },
+		{ "glBindRenderbuffer", (void **)&vrgl.BindRenderbuffer },
+		{ "glRenderbufferStorage", (void **)&vrgl.RenderbufferStorage },
+		{ "glFramebufferRenderbuffer", (void **)&vrgl.FramebufferRenderbuffer },
+		{ "glClearColor", (void **)&vrgl.ClearColor },
+		{ "glClear", (void **)&vrgl.Clear },
 	};
 	size_t i;
 
@@ -574,6 +595,20 @@ static qboolean VR_CreateSwapchains( void )
 
 	vrgl.GenFramebuffers( 1, &vr.fbo );
 
+	// the eyes are drawn one after another, so one depth buffer serves both
+	vrgl.GenRenderbuffers( 1, &vr.depth );
+	vrgl.BindRenderbuffer( VR_GL_RENDERBUFFER, vr.depth );
+	vrgl.RenderbufferStorage( VR_GL_RENDERBUFFER, VR_GL_DEPTH24_STENCIL8, vr.eye_width, vr.eye_height );
+	vrgl.BindRenderbuffer( VR_GL_RENDERBUFFER, 0 );
+
+	{
+		vr_GLint old = 0;
+		vrgl.GetIntegerv( VR_GL_DRAW_FRAMEBUFFER_BINDING, &old );
+		vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.fbo );
+		vrgl.FramebufferRenderbuffer( VR_GL_FRAMEBUFFER, VR_GL_DEPTH_STENCIL_ATTACHMENT, VR_GL_RENDERBUFFER, vr.depth );
+		vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, old );
+	}
+
 	Con_Printf( "VR: eye swapchains %ux%u, %s, %u images each\n", vr.eye_width, vr.eye_height,
 		vr.swapchain_format == VR_GL_SRGB8_ALPHA8 ? "SRGB8_ALPHA8" : "RGBA8", vr.num_images[0] );
 	return true;
@@ -586,6 +621,10 @@ static void VR_DestroySwapchains( void )
 	if( vr.fbo && vrgl.DeleteFramebuffers )
 		vrgl.DeleteFramebuffers( 1, &vr.fbo );
 	vr.fbo = 0;
+
+	if( vr.depth && vrgl.DeleteRenderbuffers )
+		vrgl.DeleteRenderbuffers( 1, &vr.depth );
+	vr.depth = 0;
 
 	for( eye = 0; eye < 2; eye++ )
 	{
@@ -620,12 +659,86 @@ static void VR_LocateViews( void )
 }
 
 /*
+VR_RenderEyes
+
+Draws the 3D view into both eye swapchain images, called by V_RenderView
+right before the desktop pass so the renderer ends the frame in the
+desktop view's state. Each eye uses the client's view origin and angles
+(mono for now) with a symmetric FOV covering the eye's OpenXR fov;
+the per-eye offset, asymmetric projection and head pose come next.
+*/
+void VR_RenderEyes( const ref_viewpass_t *rvp )
+{
+	vr_GLint old_draw = 0, old_read = 0;
+	qboolean scissor;
+	int eye;
+
+	if( !vr.frame_begun || !vr.should_render || !vr.views_valid || !vr.fbo )
+		return;
+
+	vrgl.GetIntegerv( VR_GL_DRAW_FRAMEBUFFER_BINDING, &old_draw );
+	vrgl.GetIntegerv( VR_GL_READ_FRAMEBUFFER_BINDING, &old_read );
+	scissor = vrgl.IsEnabled( VR_GL_SCISSOR_TEST );
+	if( scissor ) vrgl.Disable( VR_GL_SCISSOR_TEST );
+
+	for( eye = 0; eye < 2; eye++ )
+	{
+		XrSwapchainImageAcquireInfo acquire = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+		XrSwapchainImageWaitInfo wait = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+		XrSwapchainImageReleaseInfo release = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+		const XrFovf *fov = &vr.views[eye].fov;
+		ref_viewpass_t eye_rvp = *rvp;
+		uint32_t index;
+
+		if( XR_FAILED( pxrAcquireSwapchainImage( vr.swapchain[eye], &acquire, &index )))
+			break;
+
+		wait.timeout = XR_INFINITE_DURATION;
+		if( XR_FAILED( pxrWaitSwapchainImage( vr.swapchain[eye], &wait )))
+			break;
+
+		vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.fbo );
+		vrgl.FramebufferTexture2D( VR_GL_FRAMEBUFFER, VR_GL_COLOR_ATTACHMENT0, VR_GL_TEXTURE_2D, vr.images[eye][index].image, 0 );
+
+		if( vrgl.CheckFramebufferStatus( VR_GL_FRAMEBUFFER ) == VR_GL_FRAMEBUFFER_COMPLETE )
+		{
+			// the renderer only clears depth, the image starts out undefined
+			vrgl.ClearColor( 0.0f, 0.0f, 0.0f, 1.0f );
+			vrgl.Clear( VR_GL_COLOR_BUFFER_BIT );
+
+			eye_rvp.viewport[0] = eye_rvp.viewport[1] = 0;
+			eye_rvp.viewport[2] = vr.eye_width;
+			eye_rvp.viewport[3] = vr.eye_height;
+			eye_rvp.fov_x = ( fov->angleRight - fov->angleLeft ) * ( 180.0f / M_PI_F );
+			eye_rvp.fov_y = ( fov->angleUp - fov->angleDown ) * ( 180.0f / M_PI_F );
+			SetBits( eye_rvp.flags, RF_EXTERNAL_TARGET );
+
+			GL_RenderFrame( &eye_rvp );
+		}
+
+		vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.fbo ); // the renderer may have changed it
+		vrgl.FramebufferTexture2D( VR_GL_FRAMEBUFFER, VR_GL_COLOR_ATTACHMENT0, VR_GL_TEXTURE_2D, 0, 0 );
+		pxrReleaseSwapchainImage( vr.swapchain[eye], &release );
+
+		if( eye == 1 )
+		{
+			vr.eyes_written = true;
+			vr.frames_rendered++;
+		}
+	}
+
+	vrgl.BindFramebuffer( VR_GL_DRAW_FRAMEBUFFER, old_draw );
+	vrgl.BindFramebuffer( VR_GL_READ_FRAMEBUFFER, old_read );
+	if( scissor ) vrgl.Enable( VR_GL_SCISSOR_TEST );
+}
+
+/*
 VR_CopyDesktopToEyes
 
-Called right before the desktop window swaps. For now each eye gets the
-finished desktop frame, center-cropped to the eye's aspect ratio, so the
-whole swapchain -> projection layer -> pacing path works before the
-renderer learns to draw each eye itself.
+Called right before the desktop window swaps. When the eyes weren't
+rendered this frame (menu, console, loading), each eye gets the finished
+desktop frame instead, center-cropped to the eye's aspect ratio, so the
+2D screens stay visible in the headset.
 */
 void VR_CopyDesktopToEyes( void )
 {
@@ -633,7 +746,7 @@ void VR_CopyDesktopToEyes( void )
 	qboolean scissor, srgb;
 	int src_w, src_h, src_x, eye;
 
-	if( !vr.frame_begun || !vr.should_render || !vr.views_valid || !vr.fbo )
+	if( !vr.frame_begun || !vr.should_render || !vr.views_valid || !vr.fbo || vr.eyes_written )
 		return;
 
 	if( refState.width <= 0 || refState.height <= 0 )
@@ -685,7 +798,10 @@ void VR_CopyDesktopToEyes( void )
 		pxrReleaseSwapchainImage( vr.swapchain[eye], &release );
 
 		if( eye == 1 )
+		{
 			vr.eyes_written = true;
+			vr.frames_copied++;
+		}
 	}
 
 	vrgl.BindFramebuffer( VR_GL_DRAW_FRAMEBUFFER, old_draw );
@@ -703,6 +819,8 @@ static void VR_PrintFrameStats( void )
 		vr.display_period / 1000000.0 );
 	Con_Printf( "VR: xrWaitFrame blocked %.2f ms per frame on average, %.2f ms at most\n",
 		vr.frames ? vr.wait_total * 1000.0 / vr.frames : 0.0, vr.wait_max * 1000.0 );
+	Con_Printf( "VR: eyes rendered in %u frames, desktop copy in %u, empty %u\n",
+		vr.frames_rendered, vr.frames_copied, vr.frames - vr.frames_rendered - vr.frames_copied );
 }
 
 // the desktop mirror window must not wait for vsync while VR runs, the
@@ -738,7 +856,7 @@ static void VR_BeginSession( void )
 	}
 
 	vr.running = true;
-	vr.frames = 0;
+	vr.frames = vr.frames_rendered = vr.frames_copied = 0;
 	vr.wait_total = vr.wait_max = 0.0;
 	vr.begin_time = Platform_DoubleTime();
 	Con_Printf( "VR: session running\n" );
