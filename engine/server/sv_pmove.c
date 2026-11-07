@@ -932,6 +932,7 @@ void SV_RunCmd( sv_client_t *cl, usercmd_t *ucmd, int random_seed )
 		SV_RunCmd( cl, &cmd, random_seed );
 		cmd.msec = oldmsec / 2;
 		cmd.impulse = 0;
+		cmd.reserved[1] = cmd.reserved[2] = cmd.reserved[3] = 0; // impact_position: VR room-scale step happens once, like the impulse
 		SV_RunCmd( cl, &cmd, random_seed );
 		return;
 	}

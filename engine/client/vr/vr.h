@@ -49,6 +49,17 @@ qboolean VR_PacesFrames( void );
 struct ref_viewpass_s;
 int VR_RenderEyes( const struct ref_viewpass_s *rvp );
 
+// room scale, called by CL_CreateCmd and after the first prediction of a
+// command: the request rides in usercmd_t.impact_position, pm_shared
+// writes back how far the player really moved
+struct usercmd_s;
+void VR_RoomRequest( struct usercmd_s *cmd );
+void VR_RoomApplied( const float *moved );
+
+// the engine's usercmd_t keeps Half-Life's impact_position[3] floats as
+// raw 32-bit slots reserved[1..3]; the game DLLs see the same memory as floats
+#define VR_CMD_ROOMMOVE( cmd ) ((float *)&( cmd )->reserved[1] )
+
 // called by the renderer's buffer swap, before the desktop window swaps:
 // if the eyes weren't rendered this frame (menus, loading), copies the
 // finished desktop frame into them so 2D screens stay visible

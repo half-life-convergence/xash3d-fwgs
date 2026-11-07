@@ -21,6 +21,8 @@ GNU General Public License for more details.
 #include "vr.h"
 #include "platform/platform.h"
 #include "ref_common.h" // refState, the window size
+#include "const.h" // kRenderTransTexture
+#include "pm_local.h" // PM_CL_TraceLine flags
 #if XASH_SDL == 2
 #include <SDL.h> // SDL_GL_SetSwapInterval for the desktop mirror window
 #endif
@@ -97,6 +99,7 @@ typedef unsigned char vr_GLboolean;
 #define VR_GL_RENDERBUFFER              0x8D41
 #define VR_GL_DEPTH24_STENCIL8          0x88F0
 #define VR_GL_DEPTH_STENCIL_ATTACHMENT  0x821A
+#define VR_GL_ALPHA_TEST                0x0BC0
 
 static struct
 {
@@ -117,6 +120,7 @@ static struct
 	void (APIENTRY *FramebufferRenderbuffer)( vr_GLenum target, vr_GLenum attachment, vr_GLenum rbtarget, vr_GLuint rb );
 	void (APIENTRY *ClearColor)( float r, float g, float b, float a );
 	void (APIENTRY *Clear)( unsigned int mask );
+	void (APIENTRY *Viewport)( vr_GLint x, vr_GLint y, int width, int height );
 } vrgl;
 
 static const dllfunc_t openxr_loader_funcs[] =
@@ -174,6 +178,13 @@ static struct
 	qboolean logged_fov;
 	qboolean eyes_written; // both eye images were filled this frame
 
+	// room scale: the real head walks away from the player's collision box,
+	// the box follows through player movement when the way is clear
+	vec3_t   room_gap; // horizontal offset from the box to the head, game units, world axes
+	vec3_t   head_prev; // last head center, game units, play space axes
+	qboolean head_prev_valid;
+	float    fade; // head-in-wall fade, 0..1
+
 	uint32_t frames; // frames submitted since the session began
 	uint32_t frames_rendered; // ... of which the renderer drew the eyes
 	uint32_t frames_copied; // ... of which the eyes got the desktop copy
@@ -188,6 +199,12 @@ static struct
 static CVAR_DEFINE_AUTO( vr_worldscale, "39.37", FCVAR_ARCHIVE, "game units per real metre for head tracking" );
 static CVAR_DEFINE_AUTO( vr_heightoffset, "0", FCVAR_ARCHIVE, "metres added to the tracked head height (seated play, SteamVR null driver which sits on the floor)" );
 static CVAR_DEFINE_AUTO( vr_mirror, "0", FCVAR_ARCHIVE, "desktop window in VR: 0 = copy of the left eye (fast), 1 = full desktop render (third world pass, for streaming)" );
+static CVAR_DEFINE_AUTO( vr_roomscale, "1", FCVAR_ARCHIVE, "walking in the real room moves the player" );
+static CVAR_DEFINE_AUTO( vr_debug_headmove, "0 0", 0, "developer: move the tracked head by \"forward left\" metres in the play space, to test room scale without a headset" );
+
+// the player's collision box never follows the head more than this per
+// movement command, a lost tracking frame can't throw him across the room
+#define VR_ROOM_MAX_STEP 16.0f
 
 static const char *VR_SessionStateString( XrSessionState state )
 {
@@ -510,6 +527,7 @@ static qboolean VR_LoadGL( void )
 		{ "glFramebufferRenderbuffer", (void **)&vrgl.FramebufferRenderbuffer },
 		{ "glClearColor", (void **)&vrgl.ClearColor },
 		{ "glClear", (void **)&vrgl.Clear },
+		{ "glViewport", (void **)&vrgl.Viewport },
 	};
 	size_t i;
 
@@ -720,21 +738,202 @@ static void VR_YawVector( const vec3_t in, float sy, float cy, vec3_t out )
 	out[2] = in[2];
 }
 
+// eye or head position in game units and play space axes (not yet turned
+// by the player's yaw), with the height offset and debug head move added
+static void VR_PlayPosition( const XrVector3f *pos, vec3_t out )
+{
+	float scale = Q_max( 1.0f, vr_worldscale.value );
+	float move[2] = { 0.0f, 0.0f };
+
+	VR_VectorToGame( pos, out );
+	out[2] += vr_heightoffset.value;
+
+	if( sscanf( vr_debug_headmove.string, "%f %f", &move[0], &move[1] ) == 2 )
+	{
+		out[0] += move[0];
+		out[1] += move[1];
+	}
+
+	VectorScale( out, scale, out );
+}
+
+static void VR_HeadCenter( vec3_t out )
+{
+	vec3_t l, r;
+
+	VR_PlayPosition( &vr.views[0].pose.position, l );
+	VR_PlayPosition( &vr.views[1].pose.position, r );
+	VectorAverage( l, r, out );
+}
+
+// bottom of the player's collision box, where the STAGE floor is
+static void VR_PlayerFeet( vec3_t out )
+{
+	VectorCopy( cl.simorg, out );
+	out[2] += ( cl.local.usehull == 1 ) ? -18.0f : -36.0f; // ducked or standing hull bottom
+}
+
+static void VR_ResetRoom( void )
+{
+	VectorClear( vr.room_gap );
+	vr.head_prev_valid = false;
+	vr.fade = 0.0f;
+}
+
+static void VR_Recenter_f( void )
+{
+	VR_ResetRoom( );
+	Con_Printf( "VR: recentered, the player is under the head again\n" );
+}
+
+/*
+VR_UpdateRoom
+
+Once per rendered frame: the head's horizontal movement since the last
+frame, turned into world axes with the current yaw, is added to the gap
+between the player's collision box and the head. Using the current yaw
+for both positions means turning with the mouse or stick never shows up
+as head movement. The box catches up through VR_RoomRequest.
+*/
+static void VR_UpdateRoom( float yaw_degrees )
+{
+	float yaw = DEG2RAD( yaw_degrees );
+	vec3_t head, delta, world;
+
+	if( cls.state != ca_active || !vr_roomscale.value || vr.space_type != XR_REFERENCE_SPACE_TYPE_STAGE )
+	{
+		VR_ResetRoom( );
+		return;
+	}
+
+	VR_HeadCenter( head );
+
+	if( vr.head_prev_valid )
+	{
+		VectorSubtract( head, vr.head_prev, delta );
+		delta[2] = 0.0f;
+		VR_YawVector( delta, sinf( yaw ), cosf( yaw ), world );
+		VectorAdd( vr.room_gap, world, vr.room_gap );
+	}
+
+	VectorCopy( head, vr.head_prev );
+	vr.head_prev_valid = true;
+}
+
+/*
+VR_UpdateFade
+
+Head-in-wall fade: trace from the collision box's eye point to the real
+head. If something solid is in between, the head is in or past a wall,
+and the view fades to black over the first few units of depth, so the
+player can't look through walls by leaning or walking into them.
+*/
+static void VR_UpdateFade( const vec3_t head_world )
+{
+	vec3_t start, dir;
+	pmtrace_t *tr;
+	float len, depth;
+
+	vr.fade = 0.0f;
+
+	if( cls.state != ca_active || !cl.worldmodel )
+		return;
+
+	VectorCopy( cl.simorg, start );
+	start[2] += cl.viewheight[2];
+
+	VectorSubtract( head_world, start, dir );
+	len = VectorLength( dir );
+	if( len < 1.0f )
+		return;
+
+	tr = PM_CL_TraceLine( start, (float *)head_world, PM_STUDIO_IGNORE, 2, -1 ); // point hull
+	if( tr->fraction >= 1.0f && !tr->allsolid )
+		return;
+
+	depth = tr->allsolid ? len : ( 1.0f - tr->fraction ) * len;
+	vr.fade = bound( 0.0f, depth / 6.0f, 1.0f ); // black after 6 units (~15 cm) into the wall
+}
+
+static void VR_DrawFade( void )
+{
+	if( vr.fade <= 0.0f )
+		return;
+
+	// the renderer's 2D mode maps window coordinates onto the viewport,
+	// so the window rectangle covers the whole eye image
+	ref.dllFuncs.R_Set2DMode( true );
+	vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.fbo ); // 2D mode may bind a screen target
+	vrgl.Viewport( 0, 0, vr.eye_width, vr.eye_height );
+	vrgl.Disable( VR_GL_ALPHA_TEST );
+	ref.dllFuncs.FillRGBA( kRenderTransTexture, 0, 0, refState.width, refState.height, 0, 0, 0, (byte)( vr.fade * 255.0f ));
+	ref.dllFuncs.R_Set2DMode( false );
+	vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.fbo );
+}
+
+/*
+VR_RoomRequest
+
+Called by CL_CreateCmd: asks player movement to move the collision box
+under the head. The request travels in usercmd_t.impact_position, which
+the netcode already sends and Half-Life never uses; the game's
+pm_shared moves the box with full collision and writes back how far it
+really got (see VR_RoomApplied). Only while the client predicts
+movement, otherwise that answer never arrives and the box would move
+twice.
+*/
+void VR_RoomRequest( usercmd_t *cmd )
+{
+	float len;
+	vec3_t step;
+
+	if( !vr.running || !vr_roomscale.value || cls.state != ca_active || cl_nopred.value || cl.intermission )
+		return;
+
+	VectorCopy( vr.room_gap, step );
+	step[2] = 0.0f;
+	len = VectorLength( step );
+	if( len < 0.125f ) // below the netcode's 1/8 unit precision
+		return;
+
+	if( len > VR_ROOM_MAX_STEP )
+		VectorScale( step, VR_ROOM_MAX_STEP / len, step );
+
+	VR_CMD_ROOMMOVE( cmd )[0] = step[0];
+	VR_CMD_ROOMMOVE( cmd )[1] = step[1];
+	VR_CMD_ROOMMOVE( cmd )[2] = 0.0f;
+}
+
+/*
+VR_RoomApplied
+
+Called after a movement command was predicted for the first time, with
+pm_shared's answer: how far the box really moved toward the head.
+*/
+void VR_RoomApplied( const float *moved )
+{
+	if( !vr.running )
+		return;
+
+	vr.room_gap[0] -= moved[0];
+	vr.room_gap[1] -= moved[1];
+}
+
 /*
 VR_EyeView
 
 Places one eye in the game: the player's feet (predicted origin, no view
-bob) plus the eye's pose in the floor-level STAGE space, scaled to game
-units and turned by the player's yaw. The angles come from the headset
-alone, so there is no view bob, punch angle or roll in the eyes. Each eye
-has its own pose, so the real eye distance gives the stereo offset.
+bob) plus the room-scale gap to the head, plus the eye's offset from the
+head center and its height above the STAGE floor, scaled to game units
+and turned by the player's yaw. The angles come from the headset alone,
+so there is no view bob, punch angle or roll in the eyes. Each eye has
+its own pose, so the real eye distance gives the stereo offset.
 */
-static void VR_EyeView( const ref_viewpass_t *rvp, const XrPosef *pose, vec3_t origin, vec3_t angles )
+static void VR_EyeView( const ref_viewpass_t *rvp, const XrPosef *pose, const vec3_t head, vec3_t origin, vec3_t angles )
 {
 	static const XrVector3f xr_forward = { 0.0f, 0.0f, -1.0f };
 	static const XrVector3f xr_right = { 1.0f, 0.0f, 0.0f };
 	static const XrVector3f xr_up = { 0.0f, 1.0f, 0.0f };
-	float scale = Q_max( 1.0f, vr_worldscale.value );
 	float yaw = DEG2RAD( rvp->viewangles[YAW] );
 	float sy = sinf( yaw ), cy = cosf( yaw );
 	vec3_t base, offset, forward, right, up, v;
@@ -742,19 +941,23 @@ static void VR_EyeView( const ref_viewpass_t *rvp, const XrPosef *pose, vec3_t o
 
 	if( vr.space_type == XR_REFERENCE_SPACE_TYPE_STAGE )
 	{
-		// STAGE height is measured from the real floor, so start at the feet
-		VectorCopy( cl.simorg, base );
-		base[2] += ( cl.local.usehull == 1 ) ? -18.0f : -36.0f; // ducked or standing hull bottom
+		// STAGE height is measured from the real floor, so start at the feet;
+		// horizontally the head is wherever room scale says it is
+		VR_PlayerFeet( base );
+		base[0] += vr.room_gap[0];
+		base[1] += vr.room_gap[1];
+
+		VR_PlayPosition( &pose->position, v );
+		v[0] -= head[0]; // eye relative to the head center, height stays absolute
+		v[1] -= head[1];
 	}
 	else
 	{
 		// LOCAL starts at the head, keep the game's eye height
 		VectorCopy( rvp->vieworigin, base );
+		VR_PlayPosition( &pose->position, v );
 	}
 
-	VR_VectorToGame( &pose->position, v );
-	v[2] += vr_heightoffset.value;
-	VectorScale( v, scale, v );
 	VR_YawVector( v, sy, cy, offset );
 	VectorAdd( base, offset, origin );
 
@@ -829,6 +1032,7 @@ int VR_RenderEyes( const ref_viewpass_t *rvp )
 {
 	vr_GLint old_draw = 0, old_read = 0;
 	qboolean scissor, stepped = false, mirrored = false;
+	vec3_t head, head_world;
 	int eye;
 
 	if( !vr.frame_begun || !vr.should_render || !vr.fbo )
@@ -837,6 +1041,23 @@ int VR_RenderEyes( const ref_viewpass_t *rvp )
 	VR_LocateViews( );
 	if( !vr.views_valid )
 		return VR_EYES_NONE;
+
+	VR_UpdateRoom( rvp->viewangles[YAW] );
+	VR_HeadCenter( head );
+	{
+		// the head's place in the world, for the wall check
+		float yaw = DEG2RAD( rvp->viewangles[YAW] );
+		vec3_t feet, turned, local = { 0.0f, 0.0f, head[2] };
+
+		VR_PlayerFeet( feet );
+		VR_YawVector( local, sinf( yaw ), cosf( yaw ), turned );
+		VectorAdd( feet, turned, head_world );
+		head_world[0] += vr.room_gap[0];
+		head_world[1] += vr.room_gap[1];
+	}
+	if( vr.space_type == XR_REFERENCE_SPACE_TYPE_STAGE )
+		VR_UpdateFade( head_world );
+	else vr.fade = 0.0f;
 
 	vrgl.GetIntegerv( VR_GL_DRAW_FRAMEBUFFER_BINDING, &old_draw );
 	vrgl.GetIntegerv( VR_GL_READ_FRAMEBUFFER_BINDING, &old_read );
@@ -883,9 +1104,10 @@ int VR_RenderEyes( const ref_viewpass_t *rvp )
 			if( stepped )
 				SetBits( eye_rvp.flags, RF_REPEAT_PASS );
 
-			VR_EyeView( rvp, &vr.views[eye].pose, eye_rvp.vieworigin, eye_rvp.viewangles );
+			VR_EyeView( rvp, &vr.views[eye].pose, head, eye_rvp.vieworigin, eye_rvp.viewangles );
 
 			GL_RenderFrame( &eye_rvp );
+			VR_DrawFade( );
 			stepped = true;
 
 			if( eye == 0 && !vr_mirror.value )
@@ -1281,6 +1503,10 @@ static void VR_Info_f( void )
 
 	if( vr.running )
 		VR_PrintFrameStats( );
+
+	Con_Printf( "VR: room scale %s, player at %.1f %.1f %.1f, head %.1f units away, wall fade %.2f\n",
+		vr_roomscale.value ? "on" : "off", cl.simorg[0], cl.simorg[1], cl.simorg[2],
+		sqrtf( vr.room_gap[0] * vr.room_gap[0] + vr.room_gap[1] * vr.room_gap[1] ), vr.fade );
 }
 
 qboolean VR_Active( void )
@@ -1294,6 +1520,9 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_worldscale );
 	Cvar_RegisterVariable( &vr_heightoffset );
 	Cvar_RegisterVariable( &vr_mirror );
+	Cvar_RegisterVariable( &vr_roomscale );
+	Cvar_RegisterVariable( &vr_debug_headmove );
+	Cmd_AddCommand( "vr_recenter", VR_Recenter_f, "put the player back under the real head" );
 
 	if( !Sys_CheckParm( "-vr" ))
 		return;

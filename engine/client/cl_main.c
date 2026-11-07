@@ -810,6 +810,10 @@ static void CL_CreateCmd( void )
 	Platform_PreCreateMove();
 	clgame.dllFuncs.CL_CreateMove( host.frametime, cmd, active );
 	IN_EngineAppendMove( host.frametime, cmd, active );
+#if XASH_OPENXR
+	if( active )
+		VR_RoomRequest( cmd ); // walk the player toward the real head
+#endif
 
 	CL_PopPMStates();
 

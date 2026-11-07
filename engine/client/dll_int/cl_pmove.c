@@ -19,6 +19,9 @@ GNU General Public License for more details.
 #include "cl_tent.h"
 #include "pm_local.h"
 #include "studio.h"
+#if XASH_OPENXR
+#include "vr/vr.h"
+#endif
 
 #define MAX_FORWARD			6	// forward probes for set idealpitch
 #define MIN_CORRECTION_DISTANCE	0.25f	// use smoothing if error is > this
@@ -912,6 +915,7 @@ static void CL_RunUsercmd( local_state_t *from, local_state_t *to, usercmd_t *u,
 		split.msec /= 2;
 		CL_RunUsercmd( from, &temp, &split, runfuncs, time, random_seed );
 		split.impulse = split.weaponselect = 0;
+		split.reserved[1] = split.reserved[2] = split.reserved[3] = 0; // impact_position: VR room-scale step happens once, like the impulse
 		CL_RunUsercmd( &temp, to, &split, runfuncs, time, random_seed );
 		return;
 	}
@@ -926,6 +930,13 @@ static void CL_RunUsercmd( local_state_t *from, local_state_t *to, usercmd_t *u,
 
 		// motor!
 		clgame.dllFuncs.pfnPlayerMove( clgame.pmove, false );
+
+#if XASH_OPENXR
+		// first prediction of this command: pm_shared left the distance
+		// it really moved the player toward the head in its copy of the cmd
+		if( runfuncs )
+			VR_RoomApplied( VR_CMD_ROOMMOVE( &clgame.pmove->cmd ));
+#endif
 
 		// copy results back to client
 		CL_FinishPMove( clgame.pmove, to );
