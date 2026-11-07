@@ -183,6 +183,11 @@ static struct
 	qboolean warned_wait; // print a failing xrWaitFrame only once
 } vr;
 
+// Half-Life units are close to inches: the player is 72 units tall and
+// his eyes are 64 units above his feet
+static CVAR_DEFINE_AUTO( vr_worldscale, "39.37", FCVAR_ARCHIVE, "game units per real metre for head tracking" );
+static CVAR_DEFINE_AUTO( vr_heightoffset, "0", FCVAR_ARCHIVE, "metres added to the tracked head height (seated play, SteamVR null driver which sits on the floor)" );
+
 static const char *VR_SessionStateString( XrSessionState state )
 {
 	switch( state )
@@ -666,13 +671,105 @@ static void VR_LocateViews( void )
 		for( eye = 0; eye < 2; eye++ )
 		{
 			const XrFovf *f = &vr.views[eye].fov;
+			const XrVector3f *p = &vr.views[eye].pose.position;
 			Con_Printf( "VR: %s eye fov: left %.1f, right %.1f, down %.1f, up %.1f degrees\n",
 				eye ? "right" : "left",
 				f->angleLeft * ( 180.0f / M_PI_F ), f->angleRight * ( 180.0f / M_PI_F ),
 				f->angleDown * ( 180.0f / M_PI_F ), f->angleUp * ( 180.0f / M_PI_F ));
+			Con_Printf( "VR: %s eye at %.3f %.3f %.3f m in the %s space\n", eye ? "right" : "left",
+				p->x, p->y, p->z, vr.space_type == XR_REFERENCE_SPACE_TYPE_STAGE ? "STAGE" : "LOCAL" );
 		}
 		vr.logged_fov = true;
 	}
+}
+
+/*
+OpenXR spaces are right-handed with +X right, +Y up and -Z forward,
+Half-Life has +X forward, +Y left and +Z up
+*/
+static void VR_VectorToGame( const XrVector3f *in, vec3_t out )
+{
+	out[0] = -in->z;
+	out[1] = -in->x;
+	out[2] = in->y;
+}
+
+static void VR_RotateVector( const XrQuaternionf *q, const XrVector3f *v, XrVector3f *out )
+{
+	// v' = v + 2w(q x v) + 2(q x (q x v))
+	XrVector3f t, u;
+
+	t.x = 2.0f * ( q->y * v->z - q->z * v->y );
+	t.y = 2.0f * ( q->z * v->x - q->x * v->z );
+	t.z = 2.0f * ( q->x * v->y - q->y * v->x );
+
+	u.x = q->y * t.z - q->z * t.y;
+	u.y = q->z * t.x - q->x * t.z;
+	u.z = q->x * t.y - q->y * t.x;
+
+	out->x = v->x + q->w * t.x + u.x;
+	out->y = v->y + q->w * t.y + u.y;
+	out->z = v->z + q->w * t.z + u.z;
+}
+
+static void VR_YawVector( const vec3_t in, float sy, float cy, vec3_t out )
+{
+	out[0] = in[0] * cy - in[1] * sy;
+	out[1] = in[0] * sy + in[1] * cy;
+	out[2] = in[2];
+}
+
+/*
+VR_EyeView
+
+Places one eye in the game: the player's feet (predicted origin, no view
+bob) plus the eye's pose in the floor-level STAGE space, scaled to game
+units and turned by the player's yaw. The angles come from the headset
+alone, so there is no view bob, punch angle or roll in the eyes. Each eye
+has its own pose, so the real eye distance gives the stereo offset.
+*/
+static void VR_EyeView( const ref_viewpass_t *rvp, const XrPosef *pose, vec3_t origin, vec3_t angles )
+{
+	static const XrVector3f xr_forward = { 0.0f, 0.0f, -1.0f };
+	static const XrVector3f xr_right = { 1.0f, 0.0f, 0.0f };
+	static const XrVector3f xr_up = { 0.0f, 1.0f, 0.0f };
+	float scale = Q_max( 1.0f, vr_worldscale.value );
+	float yaw = DEG2RAD( rvp->viewangles[YAW] );
+	float sy = sinf( yaw ), cy = cosf( yaw );
+	vec3_t base, offset, forward, right, up, v;
+	XrVector3f axis;
+
+	if( vr.space_type == XR_REFERENCE_SPACE_TYPE_STAGE )
+	{
+		// STAGE height is measured from the real floor, so start at the feet
+		VectorCopy( cl.simorg, base );
+		base[2] += ( cl.local.usehull == 1 ) ? -18.0f : -36.0f; // ducked or standing hull bottom
+	}
+	else
+	{
+		// LOCAL starts at the head, keep the game's eye height
+		VectorCopy( rvp->vieworigin, base );
+	}
+
+	VR_VectorToGame( &pose->position, v );
+	v[2] += vr_heightoffset.value;
+	VectorScale( v, scale, v );
+	VR_YawVector( v, sy, cy, offset );
+	VectorAdd( base, offset, origin );
+
+	VR_RotateVector( &pose->orientation, &xr_forward, &axis );
+	VR_VectorToGame( &axis, v );
+	VR_YawVector( v, sy, cy, forward );
+
+	VR_RotateVector( &pose->orientation, &xr_right, &axis );
+	VR_VectorToGame( &axis, v );
+	VR_YawVector( v, sy, cy, right );
+
+	VR_RotateVector( &pose->orientation, &xr_up, &axis );
+	VR_VectorToGame( &axis, v );
+	VR_YawVector( v, sy, cy, up );
+
+	VectorsAngles( forward, right, up, angles );
 }
 
 /*
@@ -680,9 +777,8 @@ VR_RenderEyes
 
 Draws the 3D view into both eye swapchain images, called by V_RenderView
 right before the desktop pass so the renderer ends the frame in the
-desktop view's state. Each eye uses the client's view origin and angles
-(mono for now) with a symmetric FOV covering the eye's OpenXR fov;
-the per-eye offset, asymmetric projection and head pose come next.
+desktop view's state. The views are located again here, as late as
+possible, so the eyes and the submitted layer use the freshest head pose.
 */
 void VR_RenderEyes( const ref_viewpass_t *rvp )
 {
@@ -690,7 +786,11 @@ void VR_RenderEyes( const ref_viewpass_t *rvp )
 	qboolean scissor;
 	int eye;
 
-	if( !vr.frame_begun || !vr.should_render || !vr.views_valid || !vr.fbo )
+	if( !vr.frame_begun || !vr.should_render || !vr.fbo )
+		return;
+
+	VR_LocateViews( );
+	if( !vr.views_valid )
 		return;
 
 	vrgl.GetIntegerv( VR_GL_DRAW_FRAMEBUFFER_BINDING, &old_draw );
@@ -735,6 +835,8 @@ void VR_RenderEyes( const ref_viewpass_t *rvp )
 			eye_rvp.fov_tan[2] = tanf( fov->angleDown );
 			eye_rvp.fov_tan[3] = tanf( fov->angleUp );
 			SetBits( eye_rvp.flags, RF_EXTERNAL_TARGET|RF_ASYMMETRIC_FOV );
+
+			VR_EyeView( rvp, &vr.views[eye].pose, eye_rvp.vieworigin, eye_rvp.viewangles );
 
 			GL_RenderFrame( &eye_rvp );
 		}
@@ -1131,6 +1233,8 @@ qboolean VR_Active( void )
 void VR_Init( void )
 {
 	Cmd_AddCommand( "vr_info", VR_Info_f, "print OpenXR runtime and headset state" );
+	Cvar_RegisterVariable( &vr_worldscale );
+	Cvar_RegisterVariable( &vr_heightoffset );
 
 	if( !Sys_CheckParm( "-vr" ))
 		return;
