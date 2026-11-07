@@ -100,6 +100,8 @@ typedef unsigned char vr_GLboolean;
 #define VR_GL_DEPTH24_STENCIL8          0x88F0
 #define VR_GL_DEPTH_STENCIL_ATTACHMENT  0x821A
 #define VR_GL_ALPHA_TEST                0x0BC0
+#define VR_GL_MAX_SAMPLES               0x8D57
+#define VR_GL_NEAREST                   0x2600
 
 static struct
 {
@@ -121,6 +123,7 @@ static struct
 	void (APIENTRY *ClearColor)( float r, float g, float b, float a );
 	void (APIENTRY *Clear)( unsigned int mask );
 	void (APIENTRY *Viewport)( vr_GLint x, vr_GLint y, int width, int height );
+	void (APIENTRY *RenderbufferStorageMultisample)( vr_GLenum target, int samples, vr_GLenum format, int width, int height );
 } vrgl;
 
 static const dllfunc_t openxr_loader_funcs[] =
@@ -172,6 +175,12 @@ static struct
 	int64_t     swapchain_format;
 	vr_GLuint   fbo; // draw target for rendering/copying into swapchain images
 	vr_GLuint   depth; // depth+stencil renderbuffer shared by both eyes, stays attached to fbo
+	vr_GLuint   msaa_fbo; // with vr_msaa, the eyes are drawn here and resolved into the swapchain image
+	vr_GLuint   msaa_color;
+	vr_GLuint   msaa_depth;
+	int         samples; // 0 = no MSAA
+	uint32_t    rec_width, rec_height; // the runtime's recommended eye size, before vr_renderscale
+	uint32_t    max_width, max_height; // the runtime's swapchain size limit
 
 	XrView   views[2]; // eye poses and fovs at display_time
 	qboolean views_valid;
@@ -200,6 +209,8 @@ static CVAR_DEFINE_AUTO( vr_worldscale, "39.37", FCVAR_ARCHIVE, "game units per 
 static CVAR_DEFINE_AUTO( vr_heightoffset, "0", FCVAR_ARCHIVE, "metres added to the tracked head height (seated play, SteamVR null driver which sits on the floor)" );
 static CVAR_DEFINE_AUTO( vr_mirror, "0", FCVAR_ARCHIVE, "desktop window in VR: 0 = copy of the left eye (fast), 1 = full desktop render (third world pass, for streaming)" );
 static CVAR_DEFINE_AUTO( vr_roomscale, "1", FCVAR_ARCHIVE, "walking in the real room moves the player" );
+static CVAR_DEFINE_AUTO( vr_renderscale, "1.0", FCVAR_ARCHIVE, "eye resolution relative to what the headset recommends, 0.5 to 2" );
+static CVAR_DEFINE_AUTO( vr_msaa, "4", FCVAR_ARCHIVE, "multisample anti-aliasing samples for the eyes, 0 = off" );
 static CVAR_DEFINE_AUTO( vr_debug_headmove, "0 0", 0, "developer: move the tracked head by \"forward left\" metres in the play space, to test room scale without a headset" );
 
 // the player's collision box never follows the head more than this per
@@ -384,7 +395,12 @@ static qboolean VR_GetSystem( void )
 			props.graphicsProperties.maxSwapchainImageWidth,
 			props.graphicsProperties.maxSwapchainImageHeight,
 			props.graphicsProperties.maxLayerCount );
+		vr.max_width = props.graphicsProperties.maxSwapchainImageWidth;
+		vr.max_height = props.graphicsProperties.maxSwapchainImageHeight;
 	}
+
+	if( !vr.max_width || !vr.max_height )
+		vr.max_width = vr.max_height = 4096;
 
 	views[0].type = views[1].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
 	views[0].next = views[1].next = NULL;
@@ -398,8 +414,8 @@ static qboolean VR_GetSystem( void )
 		return false;
 	}
 
-	vr.eye_width = views[0].recommendedImageRectWidth;
-	vr.eye_height = views[0].recommendedImageRectHeight;
+	vr.rec_width = vr.eye_width = views[0].recommendedImageRectWidth;
+	vr.rec_height = vr.eye_height = views[0].recommendedImageRectHeight;
 	Con_Printf( "VR: recommended eye size %ux%u\n", vr.eye_width, vr.eye_height );
 
 	{
@@ -528,6 +544,7 @@ static qboolean VR_LoadGL( void )
 		{ "glClearColor", (void **)&vrgl.ClearColor },
 		{ "glClear", (void **)&vrgl.Clear },
 		{ "glViewport", (void **)&vrgl.Viewport },
+		{ "glRenderbufferStorageMultisample", (void **)&vrgl.RenderbufferStorageMultisample },
 	};
 	size_t i;
 
@@ -567,19 +584,62 @@ static int64_t VR_PickSwapchainFormat( void )
 	return 0;
 }
 
-static qboolean VR_CreateSwapchains( void )
+static vr_GLuint VR_CreateRenderbuffer( vr_GLenum format, int samples )
 {
+	vr_GLuint rb = 0;
+
+	vrgl.GenRenderbuffers( 1, &rb );
+	vrgl.BindRenderbuffer( VR_GL_RENDERBUFFER, rb );
+	if( samples > 1 )
+		vrgl.RenderbufferStorageMultisample( VR_GL_RENDERBUFFER, samples, format, vr.eye_width, vr.eye_height );
+	else vrgl.RenderbufferStorage( VR_GL_RENDERBUFFER, format, vr.eye_width, vr.eye_height );
+	vrgl.BindRenderbuffer( VR_GL_RENDERBUFFER, 0 );
+
+	return rb;
+}
+
+static void VR_DestroyEyeTargets( void )
+{
+	vr_GLuint rbs[3] = { vr.depth, vr.msaa_color, vr.msaa_depth };
+	int eye, i;
+
+	for( i = 0; i < 3; i++ )
+	{
+		if( rbs[i] && vrgl.DeleteRenderbuffers )
+			vrgl.DeleteRenderbuffers( 1, &rbs[i] );
+	}
+	vr.depth = vr.msaa_color = vr.msaa_depth = 0;
+	vr.samples = 0;
+
+	for( eye = 0; eye < 2; eye++ )
+	{
+		if( vr.swapchain[eye] != XR_NULL_HANDLE )
+			pxrDestroySwapchain( vr.swapchain[eye] );
+		vr.swapchain[eye] = XR_NULL_HANDLE;
+
+		if( vr.images[eye] )
+			Mem_Free( vr.images[eye] );
+		vr.images[eye] = NULL;
+		vr.num_images[eye] = 0;
+	}
+}
+
+/*
+VR_CreateEyeTargets
+
+The eye swapchains at the recommended size times vr_renderscale, and
+what the eyes are drawn into: with vr_msaa samples a multisampled color
+and depth pair that is resolved into the swapchain image afterwards,
+otherwise a plain depth buffer next to the swapchain image.
+*/
+static qboolean VR_CreateEyeTargets( void )
+{
+	float scale = bound( 0.5f, vr_renderscale.value, 2.0f );
+	vr_GLint old = 0, max_samples = 0;
 	int eye;
 
-	if( !VR_LoadGL( ))
-		return false;
-
-	vr.swapchain_format = VR_PickSwapchainFormat( );
-	if( !vr.swapchain_format )
-	{
-		Con_Printf( S_ERROR "VR: runtime offers no RGBA8 or SRGB8_ALPHA8 swapchain format\n" );
-		return false;
-	}
+	vr.eye_width = Q_min( (uint32_t)Q_rint( vr.rec_width * scale ), vr.max_width );
+	vr.eye_height = Q_min( (uint32_t)Q_rint( vr.rec_height * scale ), vr.max_height );
 
 	for( eye = 0; eye < 2; eye++ )
 	{
@@ -618,49 +678,94 @@ static qboolean VR_CreateSwapchains( void )
 		}
 	}
 
-	vrgl.GenFramebuffers( 1, &vr.fbo );
+	vrgl.GetIntegerv( VR_GL_DRAW_FRAMEBUFFER_BINDING, &old );
 
-	// the eyes are drawn one after another, so one depth buffer serves both
-	vrgl.GenRenderbuffers( 1, &vr.depth );
-	vrgl.BindRenderbuffer( VR_GL_RENDERBUFFER, vr.depth );
-	vrgl.RenderbufferStorage( VR_GL_RENDERBUFFER, VR_GL_DEPTH24_STENCIL8, vr.eye_width, vr.eye_height );
-	vrgl.BindRenderbuffer( VR_GL_RENDERBUFFER, 0 );
+	// the eyes are drawn one after another, so one set of buffers serves both
+	vr.depth = VR_CreateRenderbuffer( VR_GL_DEPTH24_STENCIL8, 0 );
+	vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.fbo );
+	vrgl.FramebufferRenderbuffer( VR_GL_FRAMEBUFFER, VR_GL_DEPTH_STENCIL_ATTACHMENT, VR_GL_RENDERBUFFER, vr.depth );
 
+	vrgl.GetIntegerv( VR_GL_MAX_SAMPLES, &max_samples );
+	vr.samples = bound( 0, (int)vr_msaa.value, max_samples );
+	if( vr.samples > 1 )
 	{
-		vr_GLint old = 0;
-		vrgl.GetIntegerv( VR_GL_DRAW_FRAMEBUFFER_BINDING, &old );
-		vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.fbo );
-		vrgl.FramebufferRenderbuffer( VR_GL_FRAMEBUFFER, VR_GL_DEPTH_STENCIL_ATTACHMENT, VR_GL_RENDERBUFFER, vr.depth );
-		vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, old );
+		// RGBA8 holds the same gamma-encoded bytes the sRGB swapchain stores,
+		// the resolve blit copies them unchanged with FRAMEBUFFER_SRGB off
+		vr.msaa_color = VR_CreateRenderbuffer( VR_GL_RGBA8, vr.samples );
+		vr.msaa_depth = VR_CreateRenderbuffer( VR_GL_DEPTH24_STENCIL8, vr.samples );
+		vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.msaa_fbo );
+		vrgl.FramebufferRenderbuffer( VR_GL_FRAMEBUFFER, VR_GL_COLOR_ATTACHMENT0, VR_GL_RENDERBUFFER, vr.msaa_color );
+		vrgl.FramebufferRenderbuffer( VR_GL_FRAMEBUFFER, VR_GL_DEPTH_STENCIL_ATTACHMENT, VR_GL_RENDERBUFFER, vr.msaa_depth );
+
+		if( vrgl.CheckFramebufferStatus( VR_GL_FRAMEBUFFER ) != VR_GL_FRAMEBUFFER_COMPLETE )
+		{
+			Con_Printf( S_WARN "VR: %dx MSAA eye buffers are incomplete, continuing without MSAA\n", vr.samples );
+			vrgl.DeleteRenderbuffers( 1, &vr.msaa_color );
+			vrgl.DeleteRenderbuffers( 1, &vr.msaa_depth );
+			vr.msaa_color = vr.msaa_depth = 0;
+			vr.samples = 0;
+		}
+	}
+	else vr.samples = 0;
+
+	vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, old );
+
+	Con_Printf( "VR: eye swapchains %ux%u (%.2fx), %s, %u images each, %s\n", vr.eye_width, vr.eye_height, scale,
+		vr.swapchain_format == VR_GL_SRGB8_ALPHA8 ? "SRGB8_ALPHA8" : "RGBA8", vr.num_images[0],
+		vr.samples ? va( "%dx MSAA", vr.samples ) : "no MSAA" );
+	return true;
+}
+
+static qboolean VR_CreateSwapchains( void )
+{
+	if( !VR_LoadGL( ))
+		return false;
+
+	vr.swapchain_format = VR_PickSwapchainFormat( );
+	if( !vr.swapchain_format )
+	{
+		Con_Printf( S_ERROR "VR: runtime offers no RGBA8 or SRGB8_ALPHA8 swapchain format\n" );
+		return false;
 	}
 
-	Con_Printf( "VR: eye swapchains %ux%u, %s, %u images each\n", vr.eye_width, vr.eye_height,
-		vr.swapchain_format == VR_GL_SRGB8_ALPHA8 ? "SRGB8_ALPHA8" : "RGBA8", vr.num_images[0] );
-	return true;
+	vrgl.GenFramebuffers( 1, &vr.fbo );
+	vrgl.GenFramebuffers( 1, &vr.msaa_fbo );
+
+	ClearBits( vr_renderscale.flags, FCVAR_CHANGED );
+	ClearBits( vr_msaa.flags, FCVAR_CHANGED );
+	return VR_CreateEyeTargets( );
 }
 
 static void VR_DestroySwapchains( void )
 {
-	int eye;
+	VR_DestroyEyeTargets( );
 
 	if( vr.fbo && vrgl.DeleteFramebuffers )
 		vrgl.DeleteFramebuffers( 1, &vr.fbo );
-	vr.fbo = 0;
+	if( vr.msaa_fbo && vrgl.DeleteFramebuffers )
+		vrgl.DeleteFramebuffers( 1, &vr.msaa_fbo );
+	vr.fbo = vr.msaa_fbo = 0;
+}
 
-	if( vr.depth && vrgl.DeleteRenderbuffers )
-		vrgl.DeleteRenderbuffers( 1, &vr.depth );
-	vr.depth = 0;
+/*
+VR_CheckEyeTargets
 
-	for( eye = 0; eye < 2; eye++ )
+vr_renderscale and vr_msaa can change at any time (the config is read
+after VR starts), the eye targets are rebuilt between frames when they do
+*/
+static void VR_CheckEyeTargets( void )
+{
+	if( !FBitSet( vr_renderscale.flags|vr_msaa.flags, FCVAR_CHANGED ))
+		return;
+
+	ClearBits( vr_renderscale.flags, FCVAR_CHANGED );
+	ClearBits( vr_msaa.flags, FCVAR_CHANGED );
+
+	VR_DestroyEyeTargets( );
+	if( !VR_CreateEyeTargets( ))
 	{
-		if( vr.swapchain[eye] != XR_NULL_HANDLE )
-			pxrDestroySwapchain( vr.swapchain[eye] );
-		vr.swapchain[eye] = XR_NULL_HANDLE;
-
-		if( vr.images[eye] )
-			Mem_Free( vr.images[eye] );
-		vr.images[eye] = NULL;
-		vr.num_images[eye] = 0;
+		Con_Printf( S_ERROR "VR: can't rebuild the eye swapchains, VR disabled\n" );
+		VR_Shutdown( );
 	}
 }
 
@@ -697,6 +802,15 @@ static void VR_LocateViews( void )
 				f->angleDown * ( 180.0f / M_PI_F ), f->angleUp * ( 180.0f / M_PI_F ));
 			Con_Printf( "VR: %s eye at %.3f %.3f %.3f m in the %s space\n", eye ? "right" : "left",
 				p->x, p->y, p->z, vr.space_type == XR_REFERENCE_SPACE_TYPE_STAGE ? "STAGE" : "LOCAL" );
+		}
+
+		{
+			// canted displays rotate the eyes against each other; sprites and
+			// particles face each eye separately then, which can shimmer
+			const XrQuaternionf *a = &vr.views[0].pose.orientation, *b = &vr.views[1].pose.orientation;
+			float dot = fabsf( a->x * b->x + a->y * b->y + a->z * b->z + a->w * b->w );
+			Con_Printf( "VR: eyes are canted %.2f degrees against each other\n",
+				2.0f * acosf( Q_min( dot, 1.0f )) * ( 180.0f / M_PI_F ));
 		}
 		vr.logged_fov = true;
 	}
@@ -1085,6 +1199,11 @@ int VR_RenderEyes( const ref_viewpass_t *rvp )
 
 		if( vrgl.CheckFramebufferStatus( VR_GL_FRAMEBUFFER ) == VR_GL_FRAMEBUFFER_COMPLETE )
 		{
+			// with MSAA the eye is drawn into the multisampled buffers and
+			// resolved into the swapchain image afterwards
+			if( vr.samples )
+				vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.msaa_fbo );
+
 			// the renderer only clears depth, the image starts out undefined
 			vrgl.ClearColor( 0.0f, 0.0f, 0.0f, 1.0f );
 			vrgl.Clear( VR_GL_COLOR_BUFFER_BIT );
@@ -1107,6 +1226,20 @@ int VR_RenderEyes( const ref_viewpass_t *rvp )
 			VR_EyeView( rvp, &vr.views[eye].pose, head, eye_rvp.vieworigin, eye_rvp.viewangles );
 
 			GL_RenderFrame( &eye_rvp );
+
+			if( vr.samples )
+			{
+				qboolean srgb = vrgl.IsEnabled( VR_GL_FRAMEBUFFER_SRGB );
+
+				if( srgb ) vrgl.Disable( VR_GL_FRAMEBUFFER_SRGB );
+				vrgl.BindFramebuffer( VR_GL_READ_FRAMEBUFFER, vr.msaa_fbo );
+				vrgl.BindFramebuffer( VR_GL_DRAW_FRAMEBUFFER, vr.fbo );
+				vrgl.BlitFramebuffer( 0, 0, vr.eye_width, vr.eye_height, 0, 0, vr.eye_width, vr.eye_height,
+					VR_GL_COLOR_BUFFER_BIT, VR_GL_NEAREST );
+				if( srgb ) vrgl.Enable( VR_GL_FRAMEBUFFER_SRGB );
+				vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.fbo );
+			}
+
 			VR_DrawFade( );
 			stepped = true;
 
@@ -1446,6 +1579,11 @@ void VR_WaitFrame( void )
 	// so every xrWaitFrame stays paired with one xrBeginFrame/xrEndFrame
 	VR_SubmitFrame( );
 
+	// no frame is open here, the only safe moment to rebuild the eye swapchains
+	VR_CheckEyeTargets( );
+	if( !vr.running )
+		return;
+
 	// blocks until the runtime wants the next frame; this is the frame limiter
 	{
 		double t = Platform_DoubleTime();
@@ -1521,6 +1659,8 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_heightoffset );
 	Cvar_RegisterVariable( &vr_mirror );
 	Cvar_RegisterVariable( &vr_roomscale );
+	Cvar_RegisterVariable( &vr_renderscale );
+	Cvar_RegisterVariable( &vr_msaa );
 	Cvar_RegisterVariable( &vr_debug_headmove );
 	Cmd_AddCommand( "vr_recenter", VR_Recenter_f, "put the player back under the real head" );
 
