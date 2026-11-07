@@ -32,11 +32,15 @@ static PFN_xrSyncActions                       pxrSyncActions;
 static PFN_xrGetActionStateBoolean             pxrGetActionStateBoolean;
 static PFN_xrGetActionStateVector2f            pxrGetActionStateVector2f;
 static PFN_xrGetCurrentInteractionProfile      pxrGetCurrentInteractionProfile;
+static PFN_xrCreateActionSpace                 pxrCreateActionSpace;
+static PFN_xrLocateSpace                       pxrLocateSpace;
+static PFN_xrDestroySpace                      pxrDestroySpace;
 
 static CVAR_DEFINE_AUTO( vr_turnmode, "0", FCVAR_ARCHIVE, "right stick turning: 0 = snap (comfortable), 1 = smooth" );
 static CVAR_DEFINE_AUTO( vr_snapturn, "45", FCVAR_ARCHIVE, "degrees per snap turn" );
 static CVAR_DEFINE_AUTO( vr_turnspeed, "120", FCVAR_ARCHIVE, "smooth turning speed, degrees per second" );
 static CVAR_DEFINE_AUTO( vr_debug_sticks, "0 0 0 0", 0, "developer: pretend the sticks are at \"left_x left_y right_x right_y\", to test without controllers" );
+static CVAR_DEFINE_AUTO( vr_debug_hands, "0", 0, "developer: fake both hands held level in front of the head (45 cm forward, 20 cm down), to test without controllers" );
 
 typedef enum
 {
@@ -49,6 +53,8 @@ typedef enum
 	VR_ACT_USE,
 	VR_ACT_RELOAD,
 	VR_ACT_MENU,
+	VR_ACT_GRIP_POSE, // pose, per hand: where the hand holds things
+	VR_ACT_AIM_POSE, // pose, per hand: the pointing ray
 	VR_ACT_COUNT
 } vr_action_t;
 
@@ -71,7 +77,12 @@ static const vr_action_def_t vr_action_defs[VR_ACT_COUNT] =
 	{ "use", "Use", XR_ACTION_TYPE_BOOLEAN_INPUT, IN_USE },
 	{ "reload", "Reload", XR_ACTION_TYPE_BOOLEAN_INPUT, IN_RELOAD },
 	{ "menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT, 0 },
+	{ "hand_grip", "Hand grip pose", XR_ACTION_TYPE_POSE_INPUT, 0 },
+	{ "hand_aim", "Hand aim pose", XR_ACTION_TYPE_POSE_INPUT, 0 },
 };
+
+// the pose actions are per hand
+#define VR_ACTION_IS_POSE( i ) ( vr_action_defs[i].type == XR_ACTION_TYPE_POSE_INPUT )
 
 typedef struct
 {
@@ -82,8 +93,15 @@ typedef struct
 // Suggested bindings. SteamVR adapts them to any controller it knows,
 // including ones without a profile here (the Steam Frame's), and players
 // can rebind everything in SteamVR's own controller binding screen.
+#define VR_HAND_POSES \
+	{ VR_ACT_GRIP_POSE, "/user/hand/left/input/grip/pose" }, \
+	{ VR_ACT_GRIP_POSE, "/user/hand/right/input/grip/pose" }, \
+	{ VR_ACT_AIM_POSE, "/user/hand/left/input/aim/pose" }, \
+	{ VR_ACT_AIM_POSE, "/user/hand/right/input/aim/pose" }
+
 static const vr_binding_t vr_bindings_index[] =
 {
+	VR_HAND_POSES,
 	{ VR_ACT_MOVE, "/user/hand/left/input/thumbstick" },
 	{ VR_ACT_TURN, "/user/hand/right/input/thumbstick" },
 	{ VR_ACT_FIRE, "/user/hand/right/input/trigger/click" },
@@ -97,6 +115,7 @@ static const vr_binding_t vr_bindings_index[] =
 
 static const vr_binding_t vr_bindings_touch[] =
 {
+	VR_HAND_POSES,
 	{ VR_ACT_MOVE, "/user/hand/left/input/thumbstick" },
 	{ VR_ACT_TURN, "/user/hand/right/input/thumbstick" },
 	{ VR_ACT_FIRE, "/user/hand/right/input/trigger/value" },
@@ -110,6 +129,7 @@ static const vr_binding_t vr_bindings_touch[] =
 
 static const vr_binding_t vr_bindings_simple[] =
 {
+	VR_HAND_POSES,
 	{ VR_ACT_FIRE, "/user/hand/right/input/select/click" },
 	{ VR_ACT_USE, "/user/hand/left/input/select/click" },
 	{ VR_ACT_MENU, "/user/hand/left/input/menu/click" },
@@ -132,6 +152,8 @@ static struct
 	qboolean     initialized;
 	XrActionSet  set;
 	XrAction     actions[VR_ACT_COUNT];
+	XrPath       hand_paths[2]; // left, right
+	XrSpace      hand_spaces[2][2]; // [grip, aim][left, right]
 
 	// this frame's state, read by VR_PreCreateMove
 	int          buttons; // IN_ bits held
@@ -157,7 +179,10 @@ static qboolean VR_LoadInputProcs( void )
 		&& VR_LOAD_PROC( xrSyncActions )
 		&& VR_LOAD_PROC( xrGetActionStateBoolean )
 		&& VR_LOAD_PROC( xrGetActionStateVector2f )
-		&& VR_LOAD_PROC( xrGetCurrentInteractionProfile );
+		&& VR_LOAD_PROC( xrGetCurrentInteractionProfile )
+		&& VR_LOAD_PROC( xrCreateActionSpace )
+		&& VR_LOAD_PROC( xrLocateSpace )
+		&& VR_LOAD_PROC( xrDestroySpace );
 }
 
 static XrPath VR_Path( const char *str )
@@ -173,9 +198,12 @@ static void VR_SuggestBindings( void )
 
 	for( p = 0; p < ARRAYSIZE( vr_profiles ); p++ )
 	{
-		XrActionSuggestedBinding suggested[VR_ACT_COUNT];
+		XrActionSuggestedBinding suggested[32];
 		XrInteractionProfileSuggestedBinding info = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
 		XrResult result;
+
+		if( vr_profiles[p].count > ARRAYSIZE( suggested ))
+			continue;
 
 		for( b = 0; b < vr_profiles[p].count; b++ )
 		{
@@ -213,9 +241,13 @@ qboolean VR_InitInput( void )
 	Cvar_RegisterVariable( &vr_snapturn );
 	Cvar_RegisterVariable( &vr_turnspeed );
 	Cvar_RegisterVariable( &vr_debug_sticks );
+	Cvar_RegisterVariable( &vr_debug_hands );
 
 	if( !VR_LoadInputProcs( ))
 		return false;
+
+	vri.hand_paths[0] = VR_Path( "/user/hand/left" );
+	vri.hand_paths[1] = VR_Path( "/user/hand/right" );
 
 	Q_strncpy( set_info.actionSetName, "gameplay", sizeof( set_info.actionSetName ));
 	Q_strncpy( set_info.localizedActionSetName, "Gameplay", sizeof( set_info.localizedActionSetName ));
@@ -233,6 +265,11 @@ qboolean VR_InitInput( void )
 		Q_strncpy( info.actionName, vr_action_defs[i].name, sizeof( info.actionName ));
 		Q_strncpy( info.localizedActionName, vr_action_defs[i].title, sizeof( info.localizedActionName ));
 		info.actionType = vr_action_defs[i].type;
+		if( VR_ACTION_IS_POSE( i ))
+		{
+			info.countSubactionPaths = 2;
+			info.subactionPaths = vri.hand_paths;
+		}
 
 		result = pxrCreateAction( vri.set, &info, &vri.actions[i] );
 		if( XR_FAILED( result ))
@@ -253,14 +290,77 @@ qboolean VR_InitInput( void )
 		return false;
 	}
 
+	// one space per pose and hand, located against the world space every frame
+	for( i = 0; i < 2; i++ )
+	{
+		int hand;
+
+		for( hand = 0; hand < 2; hand++ )
+		{
+			XrActionSpaceCreateInfo info = { XR_TYPE_ACTION_SPACE_CREATE_INFO };
+
+			info.action = vri.actions[i ? VR_ACT_AIM_POSE : VR_ACT_GRIP_POSE];
+			info.subactionPath = vri.hand_paths[hand];
+			info.poseInActionSpace.orientation.w = 1.0f;
+
+			result = pxrCreateActionSpace( VR_GetSession( ), &info, &vri.hand_spaces[i][hand] );
+			if( XR_FAILED( result ))
+			{
+				Con_Printf( S_ERROR "VR: xrCreateActionSpace failed: %s\n", VR_ResultString( result ));
+				return false;
+			}
+		}
+	}
+
 	vri.snap_armed = vri.flick_armed = true;
 	vri.initialized = true;
 	Con_Printf( "VR: controller actions ready (%d actions)\n", VR_ACT_COUNT );
 	return true;
 }
 
+/*
+VR_GetHandPose
+
+where a hand is at the given time in the given space: which = 0 for the
+grip pose (where the hand holds things), 1 for the aim pose (the pointing
+ray). False when the hand isn't tracked.
+*/
+qboolean VR_GetHandPose( int hand, int which, XrTime time, XrSpace base, XrPosef *out )
+{
+	XrSpaceLocation loc = { XR_TYPE_SPACE_LOCATION };
+	const XrSpaceLocationFlags valid = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+
+	if( !vri.initialized || hand < 0 || hand > 1 || which < 0 || which > 1 )
+		return false;
+
+	if( XR_FAILED( pxrLocateSpace( vri.hand_spaces[which][hand], base, time, &loc )))
+		return false;
+
+	if(( loc.locationFlags & valid ) != valid )
+		return false;
+
+	*out = loc.pose;
+	return true;
+}
+
+qboolean VR_DebugHands( void )
+{
+	return vr_debug_hands.value != 0.0f;
+}
+
 void VR_ShutdownInput( void )
 {
+	int i, hand;
+
+	for( i = 0; i < 2; i++ )
+	{
+		for( hand = 0; hand < 2; hand++ )
+		{
+			if( vri.hand_spaces[i][hand] != XR_NULL_HANDLE && pxrDestroySpace )
+				pxrDestroySpace( vri.hand_spaces[i][hand] );
+		}
+	}
+
 	// destroying the set destroys its actions too
 	if( vri.set != XR_NULL_HANDLE && pxrDestroyActionSet )
 		pxrDestroyActionSet( vri.set );

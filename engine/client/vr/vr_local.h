@@ -51,6 +51,13 @@ float VR_HeadYaw( void ); // degrees, where the head faces in the play space, ga
 qboolean VR_InitInput( void ); // after the session exists, attaches the action set
 void VR_ShutdownInput( void );
 void VR_InputProfileChanged( void );
+qboolean VR_GetHandPose( int hand, int which, XrTime time, XrSpace base, XrPosef *out ); // hand 0 left 1 right, which 0 grip 1 aim
+qboolean VR_DebugHands( void ); // vr_debug_hands: fake hands without controllers
+
+#define VR_HAND_LEFT  0
+#define VR_HAND_RIGHT 1
+#define VR_POSE_GRIP  0
+#define VR_POSE_AIM   1
 
 #endif // XASH_OPENXR
 

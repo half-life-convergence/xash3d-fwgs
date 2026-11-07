@@ -182,6 +182,11 @@ static struct
 	float    fade; // head-in-wall fade, 0..1
 	float    head_yaw; // degrees, where the head faces in the play space, for head-relative stick movement
 
+	// hands in the world, this frame: grip position, aim direction
+	qboolean hand_valid[2];
+	vec3_t   hand_origin[2];
+	vec3_t   hand_angles[2];
+
 	uint32_t frames; // frames submitted since the session began
 	uint32_t frames_rendered; // ... of which the renderer drew the eyes
 	uint32_t frames_copied; // ... of which the eyes got the desktop copy
@@ -199,6 +204,8 @@ static CVAR_DEFINE_AUTO( vr_mirror, "0", FCVAR_ARCHIVE, "desktop window in VR: 0
 static CVAR_DEFINE_AUTO( vr_roomscale, "1", FCVAR_ARCHIVE, "walking in the real room moves the player" );
 static CVAR_DEFINE_AUTO( vr_renderscale, "1.0", FCVAR_ARCHIVE, "eye resolution relative to what the headset recommends, 0.5 to 2" );
 static CVAR_DEFINE_AUTO( vr_msaa, "4", FCVAR_ARCHIVE, "multisample anti-aliasing samples for the eyes, 0 = off" );
+static CVAR_DEFINE_AUTO( vr_handweapon, "1", FCVAR_ARCHIVE, "the weapon follows the right hand instead of the camera" );
+static CVAR_DEFINE_AUTO( vr_viewmodel_grip, "12 6 -9", FCVAR_ARCHIVE, "where the hand holds the weapon model, \"forward right up\" in model units from its origin" );
 static CVAR_DEFINE_AUTO( vr_debug_headmove, "0 0", 0, "developer: move the tracked head by \"forward left\" metres in the play space, to test room scale without a headset" );
 
 // the player's collision box never follows the head more than this per
@@ -1079,6 +1086,108 @@ static void VR_EyeView( const ref_viewpass_t *rvp, const XrPosef *pose, const ve
 }
 
 /*
+VR_FakeHandPose
+
+vr_debug_hands: a hand held level in front of the head, 20 cm to its side,
+45 cm forward and 20 cm down (about 24 degrees below the eye, inside even
+a narrow view), pointing where the head faces
+*/
+static void VR_FakeHandPose( int hand, XrPosef *out )
+{
+	static const XrVector3f xr_forward = { 0.0f, 0.0f, -1.0f };
+	XrVector3f head, f, axis;
+	float len, side = ( hand == VR_HAND_RIGHT ) ? 0.2f : -0.2f, theta;
+
+	head.x = ( vr.views[0].pose.position.x + vr.views[1].pose.position.x ) * 0.5f;
+	head.y = ( vr.views[0].pose.position.y + vr.views[1].pose.position.y ) * 0.5f;
+	head.z = ( vr.views[0].pose.position.z + vr.views[1].pose.position.z ) * 0.5f;
+
+	VR_RotateVector( &vr.views[0].pose.orientation, &xr_forward, &axis );
+	f.x = axis.x; f.y = 0.0f; f.z = axis.z;
+	len = sqrtf( f.x * f.x + f.z * f.z );
+	if( len < 0.001f ) { f.x = 0.0f; f.z = -1.0f; len = 1.0f; }
+	f.x /= len; f.z /= len;
+
+	// right = forward x up = ( -f.z, 0, f.x )
+	out->position.x = head.x + side * -f.z + 0.45f * f.x;
+	out->position.y = head.y - 0.2f;
+	out->position.z = head.z + side * f.x + 0.45f * f.z;
+
+	// yaw only, around +Y, so that -Z turns into f
+	theta = atan2f( -f.x, -f.z );
+	out->orientation.x = 0.0f;
+	out->orientation.y = sinf( theta * 0.5f );
+	out->orientation.z = 0.0f;
+	out->orientation.w = cosf( theta * 0.5f );
+}
+
+/*
+VR_UpdateHands
+
+Both hands in the world for this frame, placed exactly like the eyes
+(player's feet + room gap + pose relative to the head, turned by the
+player's yaw): the grip pose gives the position, the aim pose the
+direction. Then the weapon model goes into the right hand: its origin is
+moved so that the point given by vr_viewmodel_grip lands in the hand.
+That replaces the client's camera-relative placement, view bob and sway
+included.
+*/
+static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
+{
+	int hand;
+
+	for( hand = 0; hand < 2; hand++ )
+	{
+		XrPosef grip, aim;
+		vec3_t dummy;
+
+		if( VR_DebugHands( ))
+		{
+			VR_FakeHandPose( hand, &grip );
+			aim = grip;
+		}
+		else if( !VR_GetHandPose( hand, VR_POSE_GRIP, vr.display_time, vr.space, &grip )
+			|| !VR_GetHandPose( hand, VR_POSE_AIM, vr.display_time, vr.space, &aim ))
+		{
+			vr.hand_valid[hand] = false;
+			continue;
+		}
+
+		VR_EyeView( rvp, &grip, head, vr.hand_origin[hand], dummy );
+		VR_EyeView( rvp, &aim, head, dummy, vr.hand_angles[hand] );
+		vr.hand_valid[hand] = true;
+	}
+
+	if( vr_handweapon.value && vr.hand_valid[VR_HAND_RIGHT] )
+	{
+		cl_entity_t *view = &clgame.viewent;
+		vec3_t f, r, u;
+		float g[3] = { 0.0f, 0.0f, 0.0f };
+
+		sscanf( vr_viewmodel_grip.string, "%f %f %f", &g[0], &g[1], &g[2] );
+		AngleVectors( vr.hand_angles[VR_HAND_RIGHT], f, r, u );
+
+		VectorCopy( vr.hand_origin[VR_HAND_RIGHT], view->origin );
+		VectorMA( view->origin, -g[0], f, view->origin );
+		VectorMA( view->origin, -g[1], r, view->origin );
+		VectorMA( view->origin, -g[2], u, view->origin );
+
+		// models use the opposite pitch sign from view angles (the renderer's
+		// "stupid quake bug" flip, V_CalcGunAngle negates it the same way)
+		VectorCopy( vr.hand_angles[VR_HAND_RIGHT], view->angles );
+		view->angles[PITCH] = -view->angles[PITCH];
+
+		// the client (V_CalcGunAngle, V_CalcRefdef with cl_viewbob) also puts its
+		// bobbing camera transform into the interpolation fields, and parts of
+		// the drawing use those: overwrite them too, or walking tilts the gun
+		VectorCopy( view->origin, view->curstate.origin );
+		VectorCopy( view->origin, view->latched.prevorigin );
+		VectorCopy( view->angles, view->curstate.angles );
+		VectorCopy( view->angles, view->latched.prevangles );
+	}
+}
+
+/*
 VR_MirrorEye
 
 Copies the eye image bound to vr.fbo into the desktop's 3D view
@@ -1157,6 +1266,7 @@ int VR_RenderEyes( const ref_viewpass_t *rvp )
 		if( fwd[0] != 0.0f || fwd[1] != 0.0f )
 			vr.head_yaw = RAD2DEG( atan2f( fwd[1], fwd[0] ));
 	}
+	VR_UpdateHands( rvp, head );
 	{
 		// the head's place in the world, for the wall check
 		float yaw = DEG2RAD( rvp->viewangles[YAW] );
@@ -1648,6 +1758,20 @@ static void VR_Info_f( void )
 	Con_Printf( "VR: room scale %s, player at %.1f %.1f %.1f yaw %.0f, head %.1f units away, wall fade %.2f\n",
 		vr_roomscale.value ? "on" : "off", cl.simorg[0], cl.simorg[1], cl.simorg[2], cl.viewangles[YAW],
 		sqrtf( vr.room_gap[0] * vr.room_gap[0] + vr.room_gap[1] * vr.room_gap[1] ), vr.fade );
+
+	{
+		int hand;
+
+		for( hand = 0; hand < 2; hand++ )
+		{
+			if( vr.hand_valid[hand] )
+				Con_Printf( "VR: %s hand at %.1f %.1f %.1f, aiming %.0f %.0f %.0f\n", hand ? "right" : "left",
+					vr.hand_origin[hand][0], vr.hand_origin[hand][1], vr.hand_origin[hand][2],
+					vr.hand_angles[hand][0], vr.hand_angles[hand][1], vr.hand_angles[hand][2] );
+			else Con_Printf( "VR: %s hand not tracked\n", hand ? "right" : "left" );
+		}
+		Con_Printf( "VR: weapon model at %.1f %.1f %.1f\n", clgame.viewent.origin[0], clgame.viewent.origin[1], clgame.viewent.origin[2] );
+	}
 }
 
 XrInstance VR_GetInstance( void )
@@ -1684,6 +1808,8 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_roomscale );
 	Cvar_RegisterVariable( &vr_renderscale );
 	Cvar_RegisterVariable( &vr_msaa );
+	Cvar_RegisterVariable( &vr_handweapon );
+	Cvar_RegisterVariable( &vr_viewmodel_grip );
 	Cvar_RegisterVariable( &vr_debug_headmove );
 	Cmd_AddCommand( "vr_recenter", VR_Recenter_f, "put the player back under the real head" );
 
