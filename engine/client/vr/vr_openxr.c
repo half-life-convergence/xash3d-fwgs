@@ -19,6 +19,10 @@ GNU General Public License for more details.
 #if XASH_OPENXR
 
 #include "vr.h"
+#include "platform/platform.h"
+#if XASH_SDL == 2
+#include <SDL.h> // SDL_GL_SetSwapInterval for the desktop mirror window
+#endif
 
 // the loader is opened in runtime, so only xrGetInstanceProcAddr is linked
 // by name and everything else is fetched through it
@@ -50,6 +54,12 @@ static PFN_xrEnumerateReferenceSpaces             pxrEnumerateReferenceSpaces;
 static PFN_xrCreateReferenceSpace                 pxrCreateReferenceSpace;
 static PFN_xrDestroySpace                         pxrDestroySpace;
 static PFN_xrPollEvent                            pxrPollEvent;
+static PFN_xrEnumerateEnvironmentBlendModes       pxrEnumerateEnvironmentBlendModes;
+static PFN_xrBeginSession                         pxrBeginSession;
+static PFN_xrEndSession                           pxrEndSession;
+static PFN_xrWaitFrame                            pxrWaitFrame;
+static PFN_xrBeginFrame                           pxrBeginFrame;
+static PFN_xrEndFrame                             pxrEndFrame;
 
 static const dllfunc_t openxr_loader_funcs[] =
 {
@@ -83,6 +93,21 @@ static struct
 	XrSessionState session_state;
 	XrSpace        space; // world origin, STAGE when the runtime has it, else LOCAL
 	XrReferenceSpaceType space_type;
+	XrEnvironmentBlendMode blend_mode;
+
+	// frame loop, only runs between xrBeginSession and xrEndSession
+	qboolean running;
+	qboolean frame_begun; // xrBeginFrame was called, xrEndFrame is owed
+	XrTime   display_time; // predicted display time of the current frame
+	XrDuration display_period;
+	qboolean should_render;
+	qboolean submits_layers; // set once eye images are submitted, see VR_UpdatePacing
+	qboolean paced; // xrWaitFrame is the frame limiter right now
+	uint32_t frames; // frames submitted since the session began
+	double   begin_time;
+	double   wait_total; // seconds spent blocked in xrWaitFrame
+	double   wait_max;
+	qboolean warned_wait; // print a failing xrWaitFrame only once
 } vr;
 
 static const char *VR_SessionStateString( XrSessionState state )
@@ -207,7 +232,13 @@ static qboolean VR_CreateInstance( void )
 		|| !VR_GET_PROC( vr.instance, xrEnumerateReferenceSpaces )
 		|| !VR_GET_PROC( vr.instance, xrCreateReferenceSpace )
 		|| !VR_GET_PROC( vr.instance, xrDestroySpace )
-		|| !VR_GET_PROC( vr.instance, xrPollEvent ))
+		|| !VR_GET_PROC( vr.instance, xrPollEvent )
+		|| !VR_GET_PROC( vr.instance, xrEnumerateEnvironmentBlendModes )
+		|| !VR_GET_PROC( vr.instance, xrBeginSession )
+		|| !VR_GET_PROC( vr.instance, xrEndSession )
+		|| !VR_GET_PROC( vr.instance, xrWaitFrame )
+		|| !VR_GET_PROC( vr.instance, xrBeginFrame )
+		|| !VR_GET_PROC( vr.instance, xrEndFrame ))
 		return false;
 
 	if( XR_SUCCEEDED( pxrGetInstanceProperties( vr.instance, &props )))
@@ -266,6 +297,18 @@ static qboolean VR_GetSystem( void )
 	vr.eye_width = views[0].recommendedImageRectWidth;
 	vr.eye_height = views[0].recommendedImageRectHeight;
 	Con_Printf( "VR: recommended eye size %ux%u\n", vr.eye_width, vr.eye_height );
+
+	{
+		// runtimes list blend modes in their preferred order, a VR headset
+		// gives OPAQUE first; xrEndFrame needs a valid one even with no layers
+		XrEnvironmentBlendMode modes[8];
+		uint32_t num_modes = 0;
+
+		vr.blend_mode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+		if( XR_SUCCEEDED( pxrEnumerateEnvironmentBlendModes( vr.instance, vr.system,
+			XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, ARRAYSIZE( modes ), &num_modes, modes )) && num_modes > 0 )
+			vr.blend_mode = modes[0];
+	}
 
 	return true;
 }
@@ -359,8 +402,96 @@ static qboolean VR_CreateSpace( void )
 	return true;
 }
 
+static void VR_PrintFrameStats( void )
+{
+	double elapsed = Platform_DoubleTime() - vr.begin_time;
+
+	Con_Printf( "VR: %u frames in %.1f s (%.1f fps), headset period %.2f ms\n",
+		vr.frames, elapsed, elapsed > 0.0 ? vr.frames / elapsed : 0.0,
+		vr.display_period / 1000000.0 );
+	Con_Printf( "VR: xrWaitFrame blocked %.2f ms per frame on average, %.2f ms at most\n",
+		vr.frames ? vr.wait_total * 1000.0 / vr.frames : 0.0, vr.wait_max * 1000.0 );
+}
+
+// the desktop mirror window must not wait for vsync while VR runs, the
+// headset's xrWaitFrame is the only thing allowed to block a frame
+static void VR_SetDesktopVsync( qboolean allow )
+{
+	if( allow )
+	{
+		SetBits( gl_vsync.flags, FCVAR_CHANGED ); // the platform reapplies gl_vsync next frame
+		return;
+	}
+
+#if XASH_SDL == 2
+	if( SDL_GL_SetSwapInterval( 0 ) < 0 )
+		Con_Printf( S_WARN "VR: can't disable desktop vsync: %s\n", SDL_GetError( ));
+#endif
+}
+
+static void VR_SubmitFrame( void );
+
+static void VR_BeginSession( void )
+{
+	XrSessionBeginInfo info = { XR_TYPE_SESSION_BEGIN_INFO };
+	XrResult result;
+
+	info.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	result = pxrBeginSession( vr.session, &info );
+
+	if( XR_FAILED( result ))
+	{
+		Con_Printf( S_ERROR "VR: xrBeginSession failed: %s\n", VR_ResultString( result ));
+		return;
+	}
+
+	vr.running = true;
+	vr.frames = 0;
+	vr.wait_total = vr.wait_max = 0.0;
+	vr.begin_time = Platform_DoubleTime();
+	Con_Printf( "VR: session running\n" );
+}
+
+// SteamVR's xrWaitFrame does not block while a session submits frames with
+// no layers (measured 0.07 ms per frame, the engine ran at ~130 fps against
+// a 90 Hz headset), so the headset only takes over pacing once eye images
+// are submitted. Until then the engine's own limiter and vsync stay in charge.
+static void VR_UpdatePacing( void )
+{
+	qboolean paced = vr.running && vr.submits_layers;
+
+	if( paced == vr.paced )
+		return;
+
+	vr.paced = paced;
+	VR_SetDesktopVsync( !paced );
+	Con_Reportf( "VR: frame pacing by %s\n", paced ? "the headset" : "the engine" );
+}
+
+static void VR_EndSession( void )
+{
+	if( !vr.running )
+		return;
+
+	VR_SubmitFrame( ); // a frame begun this host frame still has to be submitted
+	pxrEndSession( vr.session );
+	vr.running = false;
+	VR_UpdatePacing( );
+	Con_Printf( "VR: session stopped\n" );
+	VR_PrintFrameStats( );
+}
+
 static void VR_DestroySession( void )
 {
+	if( vr.running )
+	{
+		// destroying a running session is legal, just restore the desktop
+		VR_PrintFrameStats( );
+		vr.running = false;
+		vr.frame_begun = false;
+		VR_UpdatePacing( );
+	}
+
 	if( vr.space != XR_NULL_HANDLE )
 		pxrDestroySpace( vr.space );
 
@@ -380,8 +511,10 @@ static void VR_HandleSessionState( const XrEventDataSessionStateChanged *ev )
 	switch( ev->state )
 	{
 	case XR_SESSION_STATE_READY:
-		// xrBeginSession and the xrWaitFrame/xrBeginFrame/xrEndFrame loop
-		// come with the frame loop card, until then the session idles here
+		VR_BeginSession( );
+		break;
+	case XR_SESSION_STATE_STOPPING:
+		VR_EndSession( );
 		break;
 	case XR_SESSION_STATE_EXITING:
 	case XR_SESSION_STATE_LOSS_PENDING:
@@ -428,6 +561,86 @@ void VR_PollEvents( void )
 	}
 }
 
+static void VR_SubmitFrame( void )
+{
+	XrFrameEndInfo info = { XR_TYPE_FRAME_END_INFO };
+	XrResult result;
+
+	if( !vr.frame_begun )
+		return;
+
+	// no layers until the eye swapchains exist, the runtime shows its own
+	// placeholder but still counts the frame as delivered on time
+	info.displayTime = vr.display_time;
+	info.environmentBlendMode = vr.blend_mode;
+	info.layerCount = 0;
+	info.layers = NULL;
+
+	result = pxrEndFrame( vr.session, &info );
+	vr.frame_begun = false;
+
+	if( XR_FAILED( result ))
+		Con_Printf( S_ERROR "VR: xrEndFrame failed: %s\n", VR_ResultString( result ));
+	else vr.frames++;
+}
+
+void VR_WaitFrame( void )
+{
+	XrFrameWaitInfo wait_info = { XR_TYPE_FRAME_WAIT_INFO };
+	XrFrameBeginInfo begin_info = { XR_TYPE_FRAME_BEGIN_INFO };
+	XrFrameState state = { XR_TYPE_FRAME_STATE };
+	XrResult result;
+
+	VR_UpdatePacing( );
+
+	if( !vr.running )
+		return;
+
+	// a Host_Error/longjmp skipped last frame's VR_EndFrame, close it now
+	// so every xrWaitFrame stays paired with one xrBeginFrame/xrEndFrame
+	VR_SubmitFrame( );
+
+	// blocks until the runtime wants the next frame; this is the frame limiter
+	{
+		double t = Platform_DoubleTime();
+		result = pxrWaitFrame( vr.session, &wait_info, &state );
+		t = Platform_DoubleTime() - t;
+		vr.wait_total += t;
+		vr.wait_max = Q_max( vr.wait_max, t );
+	}
+	if( XR_FAILED( result ))
+	{
+		if( !vr.warned_wait )
+			Con_Printf( S_ERROR "VR: xrWaitFrame failed: %s\n", VR_ResultString( result ));
+		vr.warned_wait = true;
+		return;
+	}
+
+	vr.display_time = state.predictedDisplayTime;
+	vr.display_period = state.predictedDisplayPeriod;
+	vr.should_render = state.shouldRender;
+
+	// XR_FRAME_DISCARDED is a success code, the frame must still be ended
+	result = pxrBeginFrame( vr.session, &begin_info );
+	if( XR_FAILED( result ))
+	{
+		Con_Printf( S_ERROR "VR: xrBeginFrame failed: %s\n", VR_ResultString( result ));
+		return;
+	}
+
+	vr.frame_begun = true;
+}
+
+void VR_EndFrame( void )
+{
+	VR_SubmitFrame( );
+}
+
+qboolean VR_PacesFrames( void )
+{
+	return vr.paced;
+}
+
 static void VR_Info_f( void )
 {
 	if( !vr.initialized )
@@ -439,6 +652,9 @@ static void VR_Info_f( void )
 	Con_Printf( "VR: active, eye size %ux%u, session %s, %s space\n", vr.eye_width, vr.eye_height,
 		VR_SessionStateString( vr.session_state ),
 		vr.space_type == XR_REFERENCE_SPACE_TYPE_STAGE ? "STAGE" : "LOCAL" );
+
+	if( vr.running )
+		VR_PrintFrameStats( );
 }
 
 qboolean VR_Active( void )

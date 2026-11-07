@@ -38,6 +38,9 @@ GNU General Public License for more details.
 #include "tests.h"
 #include "library.h"
 #include "platform/platform.h"
+#if XASH_OPENXR && !XASH_DEDICATED
+#include "vr/vr.h"
+#endif
 
 host_parm_t host;	// host parms
 static jmp_buf return_from_main_buf;
@@ -543,6 +546,13 @@ static double Host_CalcFPS( void )
 static qboolean Host_Autosleep( double dt, double scale )
 {
 	double targetframetime;
+
+#if XASH_OPENXR && !XASH_DEDICATED
+	// xrWaitFrame in the main loop already paced this frame to the headset
+	if( VR_PacesFrames( ))
+		return true;
+#endif
+
 	double fps = Host_CalcFPS();
 
 	if( fps <= 0 )
@@ -1355,9 +1365,15 @@ int EXPORT Host_Main( int argc, char **argv, const char *progname, int bChangeGa
 	// main window message loop
 	while( host.status != HOST_CRASHED )
 	{
+#if XASH_OPENXR && !XASH_DEDICATED
+		VR_WaitFrame(); // blocks until the headset wants a frame, before timing it
+#endif
 		double newtime = Platform_DoubleTime();
 		COM_Frame( newtime - oldtime );
 		oldtime = newtime;
+#if XASH_OPENXR && !XASH_DEDICATED
+		VR_EndFrame();
+#endif
 	}
 
 	return 0;

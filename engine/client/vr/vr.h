@@ -28,6 +28,18 @@ qboolean VR_Active( void );
 // called at the start of every client frame, never blocks
 void VR_PollEvents( void );
 
+// frame loop, called from the Host_Main loop around COM_Frame:
+// VR_WaitFrame blocks in xrWaitFrame until the headset wants the next frame
+// and then calls xrBeginFrame, VR_EndFrame submits it with xrEndFrame.
+// Both do nothing unless the session is running.
+void VR_WaitFrame( void );
+void VR_EndFrame( void );
+
+// true while xrWaitFrame paces frames, the engine's own fps limiter must
+// stay out of the way then. Only true once eye images are submitted:
+// SteamVR doesn't throttle xrWaitFrame for frames without layers.
+qboolean VR_PacesFrames( void );
+
 #endif // XASH_OPENXR
 
 #endif // VR_H
