@@ -426,13 +426,31 @@ void V_RenderView( void )
 		}
 
 #if XASH_OPENXR
-		// eyes first, so the renderer ends the frame in the desktop view's state;
-		// with a menu up the headset gets the desktop copy instead (VR_CopyDesktopToEyes)
-		if( viewnum == 0 && !FBitSet( rvp.flags, RF_ONLY_CLIENTDRAW ) && !UI_IsVisible( ))
-			VR_RenderEyes( &rvp );
-#endif
+		{
+			int eyes = VR_EYES_NONE;
 
+			// eyes first, so the renderer ends the frame in the desktop view's state;
+			// with a menu up the headset gets the desktop copy instead (VR_CopyDesktopToEyes)
+			if( viewnum == 0 && !FBitSet( rvp.flags, RF_ONLY_CLIENTDRAW ) && !UI_IsVisible( ))
+				eyes = VR_RenderEyes( &rvp );
+
+			if( eyes == VR_EYES_MIRRORED )
+			{
+				// the desktop view already holds the left eye, keep what
+				// GL_RenderFrame would have published for the HUD and sound
+				VectorCopy( rvp.vieworigin, refState.vieworg );
+				VectorCopy( rvp.viewangles, refState.viewangles );
+			}
+			else
+			{
+				if( eyes == VR_EYES_RENDERED )
+					SetBits( rvp.flags, RF_REPEAT_PASS );
+				GL_RenderFrame( &rvp );
+			}
+		}
+#else
 		GL_RenderFrame( &rvp );
+#endif
 		S_UpdateFrame( &rvp );
 		viewnum++;
 

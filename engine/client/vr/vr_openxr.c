@@ -187,6 +187,7 @@ static struct
 // his eyes are 64 units above his feet
 static CVAR_DEFINE_AUTO( vr_worldscale, "39.37", FCVAR_ARCHIVE, "game units per real metre for head tracking" );
 static CVAR_DEFINE_AUTO( vr_heightoffset, "0", FCVAR_ARCHIVE, "metres added to the tracked head height (seated play, SteamVR null driver which sits on the floor)" );
+static CVAR_DEFINE_AUTO( vr_mirror, "0", FCVAR_ARCHIVE, "desktop window in VR: 0 = copy of the left eye (fast), 1 = full desktop render (third world pass, for streaming)" );
 
 static const char *VR_SessionStateString( XrSessionState state )
 {
@@ -773,25 +774,69 @@ static void VR_EyeView( const ref_viewpass_t *rvp, const XrPosef *pose, vec3_t o
 }
 
 /*
+VR_MirrorEye
+
+Copies the eye image bound to vr.fbo into the desktop's 3D view
+rectangle of the framebuffer the renderer was drawing to, center-cropped
+to the view's aspect, so the desktop window shows what the headset shows
+without drawing the world a third time. The HUD and 2D draw over it as
+usual afterwards.
+*/
+static void VR_MirrorEye( const ref_viewpass_t *rvp, vr_GLuint desktop_fbo )
+{
+	int dst_x0 = rvp->viewport[0];
+	int dst_y0 = refState.height - ( rvp->viewport[1] + rvp->viewport[3] ); // viewport y counts from the top
+	int dst_w = rvp->viewport[2], dst_h = rvp->viewport[3];
+	int src_w = vr.eye_width, src_h = vr.eye_height;
+	qboolean srgb;
+
+	if( dst_w <= 0 || dst_h <= 0 )
+		return;
+
+	if( (double)dst_w / dst_h > (double)src_w / src_h )
+		src_h = (int)((double)src_w * dst_h / dst_w ); // view is wider: full eye width
+	else
+		src_w = (int)((double)src_h * dst_w / dst_h ); // view is taller: full eye height
+
+	srgb = vrgl.IsEnabled( VR_GL_FRAMEBUFFER_SRGB );
+	if( srgb ) vrgl.Disable( VR_GL_FRAMEBUFFER_SRGB );
+
+	vrgl.BindFramebuffer( VR_GL_READ_FRAMEBUFFER, vr.fbo );
+	vrgl.BindFramebuffer( VR_GL_DRAW_FRAMEBUFFER, desktop_fbo );
+	vrgl.BlitFramebuffer(
+		( vr.eye_width - src_w ) / 2, ( vr.eye_height - src_h ) / 2,
+		( vr.eye_width + src_w ) / 2, ( vr.eye_height + src_h ) / 2,
+		dst_x0, dst_y0, dst_x0 + dst_w, dst_y0 + dst_h,
+		VR_GL_COLOR_BUFFER_BIT, VR_GL_LINEAR );
+
+	if( srgb ) vrgl.Enable( VR_GL_FRAMEBUFFER_SRGB );
+}
+
+/*
 VR_RenderEyes
 
 Draws the 3D view into both eye swapchain images, called by V_RenderView
 right before the desktop pass so the renderer ends the frame in the
 desktop view's state. The views are located again here, as late as
 possible, so the eyes and the submitted layer use the freshest head pose.
+
+The left eye is the frame's main pass: it steps time and runs viewmodel
+events. The right eye, and the desktop pass if it still runs, are
+RF_REPEAT_PASS. With vr_mirror 0 the left eye is also copied into the
+desktop view and the desktop pass is skipped.
 */
-void VR_RenderEyes( const ref_viewpass_t *rvp )
+int VR_RenderEyes( const ref_viewpass_t *rvp )
 {
 	vr_GLint old_draw = 0, old_read = 0;
-	qboolean scissor;
+	qboolean scissor, stepped = false, mirrored = false;
 	int eye;
 
 	if( !vr.frame_begun || !vr.should_render || !vr.fbo )
-		return;
+		return VR_EYES_NONE;
 
 	VR_LocateViews( );
 	if( !vr.views_valid )
-		return;
+		return VR_EYES_NONE;
 
 	vrgl.GetIntegerv( VR_GL_DRAW_FRAMEBUFFER_BINDING, &old_draw );
 	vrgl.GetIntegerv( VR_GL_READ_FRAMEBUFFER_BINDING, &old_read );
@@ -835,10 +880,19 @@ void VR_RenderEyes( const ref_viewpass_t *rvp )
 			eye_rvp.fov_tan[2] = tanf( fov->angleDown );
 			eye_rvp.fov_tan[3] = tanf( fov->angleUp );
 			SetBits( eye_rvp.flags, RF_EXTERNAL_TARGET|RF_ASYMMETRIC_FOV );
+			if( stepped )
+				SetBits( eye_rvp.flags, RF_REPEAT_PASS );
 
 			VR_EyeView( rvp, &vr.views[eye].pose, eye_rvp.vieworigin, eye_rvp.viewangles );
 
 			GL_RenderFrame( &eye_rvp );
+			stepped = true;
+
+			if( eye == 0 && !vr_mirror.value )
+			{
+				VR_MirrorEye( rvp, (vr_GLuint)old_draw );
+				mirrored = true;
+			}
 		}
 
 		vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.fbo ); // the renderer may have changed it
@@ -855,6 +909,10 @@ void VR_RenderEyes( const ref_viewpass_t *rvp )
 	vrgl.BindFramebuffer( VR_GL_DRAW_FRAMEBUFFER, old_draw );
 	vrgl.BindFramebuffer( VR_GL_READ_FRAMEBUFFER, old_read );
 	if( scissor ) vrgl.Enable( VR_GL_SCISSOR_TEST );
+
+	if( mirrored )
+		return VR_EYES_MIRRORED;
+	return stepped ? VR_EYES_RENDERED : VR_EYES_NONE;
 }
 
 /*
@@ -1235,6 +1293,7 @@ void VR_Init( void )
 	Cmd_AddCommand( "vr_info", VR_Info_f, "print OpenXR runtime and headset state" );
 	Cvar_RegisterVariable( &vr_worldscale );
 	Cvar_RegisterVariable( &vr_heightoffset );
+	Cvar_RegisterVariable( &vr_mirror );
 
 	if( !Sys_CheckParm( "-vr" ))
 		return;

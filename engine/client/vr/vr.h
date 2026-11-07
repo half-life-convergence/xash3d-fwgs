@@ -41,9 +41,13 @@ void VR_EndFrame( void );
 qboolean VR_PacesFrames( void );
 
 // called by V_RenderView before the desktop pass: draws the 3D view into
-// both eye swapchains through the renderer (RF_EXTERNAL_TARGET)
+// both eye swapchains through the renderer (RF_EXTERNAL_TARGET) and says
+// what the desktop pass has to do
+#define VR_EYES_NONE     0 // eyes not drawn, desktop pass runs normally
+#define VR_EYES_RENDERED 1 // eyes drawn, desktop pass runs as RF_REPEAT_PASS (vr_mirror 1)
+#define VR_EYES_MIRRORED 2 // eyes drawn and the left eye copied into the desktop view, skip the desktop pass
 struct ref_viewpass_s;
-void VR_RenderEyes( const struct ref_viewpass_s *rvp );
+int VR_RenderEyes( const struct ref_viewpass_s *rvp );
 
 // called by the renderer's buffer swap, before the desktop window swaps:
 // if the eyes weren't rendered this frame (menus, loading), copies the

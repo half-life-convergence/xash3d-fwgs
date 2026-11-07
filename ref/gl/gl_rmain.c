@@ -978,8 +978,8 @@ void R_RenderScene( void )
 		gEngfuncs.Host_Error( "%s: NULL worldmodel\n", __func__ );
 
 	// frametime is valid only for normal pass, extra passes of the same
-	// frame (VR eyes) must not step particles and animations again
-	if( !FBitSet( RI.rvp.flags, RF_DRAW_CUBEMAP|RF_EXTERNAL_TARGET ))
+	// frame (second VR eye, desktop mirror) must not step particles and animations again
+	if( !FBitSet( RI.rvp.flags, RF_DRAW_CUBEMAP|RF_REPEAT_PASS ))
 		tr.frametime = gp_cl->time -   gp_cl->oldtime;
 	else tr.frametime = 0.0;
 
@@ -1134,7 +1134,7 @@ void R_RenderFrame( const ref_viewpass_t *rvp )
 	}
 
 	tr.fCustomRendering = false;
-	if( !FBitSet( RI.rvp.flags, RF_ONLY_CLIENTDRAW|RF_EXTERNAL_TARGET ))
+	if( !FBitSet( RI.rvp.flags, RF_ONLY_CLIENTDRAW|RF_REPEAT_PASS ))
 		R_RunViewmodelEvents();
 
 	tr.realframecount++; // right called after viewmodel events
