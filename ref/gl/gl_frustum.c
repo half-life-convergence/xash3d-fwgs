@@ -70,6 +70,45 @@ void GL_FrustumInitProj( gl_frustum_t *out, float flZNear, float flZFar, float f
 	GL_FrustumSetPlane( out, FRUSTUM_NEAR, RI.cull_vforward, DotProduct( RI.cull_vforward, nearpoint ));
 }
 
+/*
+GL_FrustumInitProjAsym
+
+like GL_FrustumInitProj, but each side has its own angle, given as the
+tangent of its half-angle (left and down negative), for VR eye views.
+Each plane's normal is perpendicular to its edge direction forward + tan * side
+and points into the view, the same planes GL_FrustumInitProj makes when
+the angles are symmetric.
+*/
+void GL_FrustumInitProjAsym( gl_frustum_t *out, float flZFar, const float fov_tan[4] )
+{
+	const float tl = fov_tan[0], tr = fov_tan[1], td = fov_tan[2], tu = fov_tan[3];
+	vec3_t normal, iforward, farpoint;
+
+	// right edge (FRUSTUM_LEFT holds it in GL_FrustumInitProj too)
+	VectorMAM( tr, RI.cull_vforward, -1.0f, RI.cull_vright, normal );
+	VectorNormalize( normal );
+	GL_FrustumSetPlane( out, FRUSTUM_LEFT, normal, DotProduct( RI.cullorigin, normal ));
+
+	// left edge
+	VectorMAM( -tl, RI.cull_vforward, 1.0f, RI.cull_vright, normal );
+	VectorNormalize( normal );
+	GL_FrustumSetPlane( out, FRUSTUM_RIGHT, normal, DotProduct( RI.cullorigin, normal ));
+
+	// top edge
+	VectorMAM( tu, RI.cull_vforward, -1.0f, RI.cull_vup, normal );
+	VectorNormalize( normal );
+	GL_FrustumSetPlane( out, FRUSTUM_BOTTOM, normal, DotProduct( RI.cullorigin, normal ));
+
+	// bottom edge
+	VectorMAM( -td, RI.cull_vforward, 1.0f, RI.cull_vup, normal );
+	VectorNormalize( normal );
+	GL_FrustumSetPlane( out, FRUSTUM_TOP, normal, DotProduct( RI.cullorigin, normal ));
+
+	VectorNegate( RI.cull_vforward, iforward );
+	VectorMA( RI.cullorigin, flZFar, RI.cull_vforward, farpoint );
+	GL_FrustumSetPlane( out, FRUSTUM_FAR, iforward, DotProduct( iforward, farpoint ));
+}
+
 void GL_FrustumInitOrtho( gl_frustum_t *out, float xLeft, float xRight, float yTop, float yBottom, float flZNear, float flZFar )
 {
 	// setup the near and far planes

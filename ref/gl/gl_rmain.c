@@ -359,6 +359,10 @@ void R_SetupFrustum( void )
 		const ref_overview_t	*ov = gEngfuncs.GetOverviewParms();
 		GL_FrustumInitOrtho( &RI.frustum, ov->xLeft, ov->xRight, ov->yTop, ov->yBottom, ov->zNear, ov->zFar );
 	}
+	else if( FBitSet( RI.rvp.flags, RF_ASYMMETRIC_FOV ))
+	{
+		GL_FrustumInitProjAsym( &RI.frustum, R_GetFarClip(), RI.rvp.fov_tan );
+	}
 	else
 	{
 		GL_FrustumInitProj( &RI.frustum, 0.0f, R_GetFarClip(), RI.rvp.fov_x, RI.rvp.fov_y ); // NOTE: we ignore nearplane here (mirrors only)
@@ -383,6 +387,15 @@ static void R_SetupProjectionMatrix( matrix4x4 m )
 
 	GLfloat zNear = 4.0f;
 	GLfloat zFar = Q_max( 256.0f, RI.farClip );
+
+	if( FBitSet( RI.rvp.flags, RF_ASYMMETRIC_FOV ))
+	{
+		// VR eye: off-center frustum straight from the headset's per-eye angles
+		Matrix4x4_CreateProjection( m,
+			zNear * RI.rvp.fov_tan[1], zNear * RI.rvp.fov_tan[0],
+			zNear * RI.rvp.fov_tan[3], zNear * RI.rvp.fov_tan[2], zNear, zFar );
+		return;
+	}
 
 	GLfloat yMax = zNear * tan( RI.rvp.fov_y * M_PI_F / 360.0f );
 	GLfloat yMin = -yMax;

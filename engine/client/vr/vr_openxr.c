@@ -171,6 +171,7 @@ static struct
 
 	XrView   views[2]; // eye poses and fovs at display_time
 	qboolean views_valid;
+	qboolean logged_fov;
 	qboolean eyes_written; // both eye images were filled this frame
 
 	uint32_t frames; // frames submitted since the session began
@@ -656,6 +657,22 @@ static void VR_LocateViews( void )
 		&& count == 2
 		&& FBitSet( state.viewStateFlags, XR_VIEW_STATE_POSITION_VALID_BIT )
 		&& FBitSet( state.viewStateFlags, XR_VIEW_STATE_ORIENTATION_VALID_BIT );
+
+	if( vr.views_valid && !vr.logged_fov )
+	{
+		int eye;
+
+		// the per-eye angles are fixed by the headset's lenses, log them once
+		for( eye = 0; eye < 2; eye++ )
+		{
+			const XrFovf *f = &vr.views[eye].fov;
+			Con_Printf( "VR: %s eye fov: left %.1f, right %.1f, down %.1f, up %.1f degrees\n",
+				eye ? "right" : "left",
+				f->angleLeft * ( 180.0f / M_PI_F ), f->angleRight * ( 180.0f / M_PI_F ),
+				f->angleDown * ( 180.0f / M_PI_F ), f->angleUp * ( 180.0f / M_PI_F ));
+		}
+		vr.logged_fov = true;
+	}
 }
 
 /*
@@ -709,9 +726,15 @@ void VR_RenderEyes( const ref_viewpass_t *rvp )
 			eye_rvp.viewport[0] = eye_rvp.viewport[1] = 0;
 			eye_rvp.viewport[2] = vr.eye_width;
 			eye_rvp.viewport[3] = vr.eye_height;
+			// fov_x/fov_y stay a symmetric cover for code that only knows those,
+			// projection and culling use the exact per-eye angles
 			eye_rvp.fov_x = ( fov->angleRight - fov->angleLeft ) * ( 180.0f / M_PI_F );
 			eye_rvp.fov_y = ( fov->angleUp - fov->angleDown ) * ( 180.0f / M_PI_F );
-			SetBits( eye_rvp.flags, RF_EXTERNAL_TARGET );
+			eye_rvp.fov_tan[0] = tanf( fov->angleLeft );
+			eye_rvp.fov_tan[1] = tanf( fov->angleRight );
+			eye_rvp.fov_tan[2] = tanf( fov->angleDown );
+			eye_rvp.fov_tan[3] = tanf( fov->angleUp );
+			SetBits( eye_rvp.flags, RF_EXTERNAL_TARGET|RF_ASYMMETRIC_FOV );
 
 			GL_RenderFrame( &eye_rvp );
 		}

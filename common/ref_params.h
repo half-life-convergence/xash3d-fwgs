@@ -93,6 +93,7 @@ typedef struct ref_overview_s
 #define RF_DRAW_OVERVIEW	(1<<2)		// overview mode is active
 #define RF_ONLY_CLIENTDRAW	(1<<3)		// nothing is drawn by the engine except clientDraw functions
 #define RF_EXTERNAL_TARGET	(1<<4)		// draw into the framebuffer the caller bound (VR eye): viewport is in its pixels, no scene target, no time step, no viewmodel events
+#define RF_ASYMMETRIC_FOV	(1<<5)		// projection and culling use fov_tan instead of fov_x/fov_y (VR eye)
 
 // intermediate struct for viewpass (or just a single frame)
 typedef struct ref_viewpass_s
@@ -103,6 +104,10 @@ typedef struct ref_viewpass_s
 	int		viewentity;	// entitynum (P2: Savior uses this)
 	float		fov_x, fov_y;	// vertical & horizontal FOV
 	int		flags;		// if !=0 nothing is drawn by the engine except clientDraw functions
+
+	// only valid with RF_ASYMMETRIC_FOV, kept last so code built against the
+	// older struct still reads the fields above correctly
+	float		fov_tan[4];	// tangents of the left, right, down and up half-angles (left and down negative)
 } ref_viewpass_t;
 
 #endif//REF_PARAMS_H
