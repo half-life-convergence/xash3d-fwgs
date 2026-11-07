@@ -76,6 +76,10 @@ void VR_CreateMove( struct usercmd_s *cmd );
 // finished desktop frame into them so 2D screens stay visible
 void VR_CopyDesktopToEyes( void );
 
+// called by CL_IsInGame: true while the headset has no focus (taken off,
+// asleep, system menu open), which pauses singleplayer like the menu does
+qboolean VR_PausesGame( void );
+
 #endif // XASH_OPENXR
 
 #endif // VR_H

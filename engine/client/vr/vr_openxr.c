@@ -192,6 +192,21 @@ static struct
 	vec3_t   head_origin;
 	vec3_t   head_angles;
 
+	// loading panel: while the game loads, the headset gets only a
+	// world-locked quad with the loading screen on it, see VR_UpdateTransition
+	XrSwapchain panel_swapchain;
+	XrSwapchainImageOpenGLKHR *panel_images;
+	uint32_t panel_num_images;
+	qboolean panel_valid; // drawn for the current loading
+	XrPosef  panel_pose;
+	int      transition; // VR_TRANSITION_*
+	double   transition_time; // when the current phase began
+	double   transition_last; // last update, for the fade speed
+	int      hold_frames; // frames rendered since loading ended
+	float    load_fade; // fade-in after loading, 0..1, drawn like the wall fade
+	qboolean game_paused; // the session lost focus, the game is paused
+	uint32_t frames_panel; // frames submitted with the loading panel
+
 	uint32_t frames; // frames submitted since the session began
 	uint32_t frames_rendered; // ... of which the renderer drew the eyes
 	uint32_t frames_copied; // ... of which the eyes got the desktop copy
@@ -212,6 +227,22 @@ static CVAR_DEFINE_AUTO( vr_msaa, "4", FCVAR_ARCHIVE, "multisample anti-aliasing
 static CVAR_DEFINE_AUTO( vr_handweapon, "1", FCVAR_ARCHIVE, "the weapon follows the right hand instead of the camera" );
 static CVAR_DEFINE_AUTO( vr_viewmodel_grip, "12 6 -9", FCVAR_ARCHIVE, "where the hand holds the weapon model, \"forward right up\" in model units from its origin" );
 static CVAR_DEFINE_AUTO( vr_debug_headmove, "0 0", 0, "developer: move the tracked head by \"forward left\" metres in the play space, to test room scale without a headset" );
+static CVAR_DEFINE_AUTO( vr_loadfade, "0.5", FCVAR_ARCHIVE, "seconds the view takes to fade in after loading, 0 = no fade" );
+static CVAR_DEFINE_AUTO( vr_debug_unfocused, "0", 0, "developer: act as if the headset lost focus (headset off, system menu open), to test pausing without a headset" );
+
+// loading transitions, see VR_UpdateTransition
+#define VR_TRANSITION_NONE    0 // playing, the eyes are submitted
+#define VR_TRANSITION_LOADING 1 // the game is loading, only the panel is submitted
+#define VR_TRANSITION_HOLD    2 // loaded, the panel stays until the first frames run smoothly
+#define VR_TRANSITION_FADEIN  3 // the eyes are back, fading in from black
+
+#define VR_PANEL_WIDTH  1280 // loading panel image, 16:9 like most desktop windows
+#define VR_PANEL_HEIGHT 720
+#define VR_PANEL_METRES 1.6f // panel width in the room
+#define VR_PANEL_DISTANCE 2.0f // in front of the head
+#define VR_PANEL_TEXT 0.5f // LOADING image width, part of the panel's width
+#define VR_HOLD_FRAMES 5 // after loading, rendered frames before the world is shown...
+#define VR_HOLD_TIME 0.25 // ... and seconds, so the first hitches stay hidden
 
 // the player's collision box never follows the head more than this per
 // movement command, a lost tracking frame can't throw him across the room
@@ -716,6 +747,67 @@ static qboolean VR_CreateEyeTargets( void )
 	return true;
 }
 
+/*
+VR_CreatePanel
+
+The loading panel's swapchain, made once per session. It's small and
+doesn't depend on vr_renderscale or vr_msaa. Without it loading still
+works, the headset just gets no layers then.
+*/
+static void VR_CreatePanel( void )
+{
+	XrSwapchainCreateInfo info = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+	XrResult result;
+	uint32_t i;
+
+	info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+	info.format = vr.swapchain_format;
+	info.sampleCount = 1;
+	info.width = VR_PANEL_WIDTH;
+	info.height = VR_PANEL_HEIGHT;
+	info.faceCount = 1;
+	info.arraySize = 1;
+	info.mipCount = 1;
+
+	result = pxrCreateSwapchain( vr.session, &info, &vr.panel_swapchain );
+	if( XR_FAILED( result ))
+	{
+		vr.panel_swapchain = XR_NULL_HANDLE;
+		Con_Printf( S_WARN "VR: can't create the loading panel: %s\n", VR_ResultString( result ));
+		return;
+	}
+
+	pxrEnumerateSwapchainImages( vr.panel_swapchain, 0, &vr.panel_num_images, NULL );
+	vr.panel_images = Mem_Calloc( host.mempool, sizeof( *vr.panel_images ) * vr.panel_num_images );
+	for( i = 0; i < vr.panel_num_images; i++ )
+		vr.panel_images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
+
+	result = pxrEnumerateSwapchainImages( vr.panel_swapchain, vr.panel_num_images, &vr.panel_num_images,
+		(XrSwapchainImageBaseHeader *)vr.panel_images );
+	if( XR_FAILED( result ))
+	{
+		Con_Printf( S_WARN "VR: can't get the loading panel images: %s\n", VR_ResultString( result ));
+		pxrDestroySwapchain( vr.panel_swapchain );
+		vr.panel_swapchain = XR_NULL_HANDLE;
+		Mem_Free( vr.panel_images );
+		vr.panel_images = NULL;
+		vr.panel_num_images = 0;
+	}
+}
+
+static void VR_DestroyPanel( void )
+{
+	if( vr.panel_swapchain != XR_NULL_HANDLE )
+		pxrDestroySwapchain( vr.panel_swapchain );
+	vr.panel_swapchain = XR_NULL_HANDLE;
+
+	if( vr.panel_images )
+		Mem_Free( vr.panel_images );
+	vr.panel_images = NULL;
+	vr.panel_num_images = 0;
+	vr.panel_valid = false;
+}
+
 static qboolean VR_CreateSwapchains( void )
 {
 	if( !VR_LoadGL( ))
@@ -733,12 +825,14 @@ static qboolean VR_CreateSwapchains( void )
 
 	ClearBits( vr_renderscale.flags, FCVAR_CHANGED );
 	ClearBits( vr_msaa.flags, FCVAR_CHANGED );
+	VR_CreatePanel( );
 	return VR_CreateEyeTargets( );
 }
 
 static void VR_DestroySwapchains( void )
 {
 	VR_DestroyEyeTargets( );
+	VR_DestroyPanel( );
 
 	if( vr.fbo && vrgl.DeleteFramebuffers )
 		vrgl.DeleteFramebuffers( 1, &vr.fbo );
@@ -971,7 +1065,10 @@ static void VR_UpdateFade( const vec3_t head_world )
 
 static void VR_DrawFade( void )
 {
-	if( vr.fade <= 0.0f )
+	// the head-in-wall fade and the fade-in after loading share one black overlay
+	float fade = Q_max( vr.fade, vr.load_fade );
+
+	if( fade <= 0.0f )
 		return;
 
 	// the renderer's 2D mode maps window coordinates onto the viewport,
@@ -980,7 +1077,7 @@ static void VR_DrawFade( void )
 	vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.fbo ); // 2D mode may bind a screen target
 	vrgl.Viewport( 0, 0, vr.eye_width, vr.eye_height );
 	vrgl.Disable( VR_GL_ALPHA_TEST );
-	ref.dllFuncs.FillRGBA( kRenderTransTexture, 0, 0, refState.width, refState.height, 0, 0, 0, (byte)( vr.fade * 255.0f ));
+	ref.dllFuncs.FillRGBA( kRenderTransTexture, 0, 0, refState.width, refState.height, 0, 0, 0, (byte)( fade * 255.0f ));
 	ref.dllFuncs.R_Set2DMode( false );
 	vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.fbo );
 }
@@ -1444,11 +1541,168 @@ rendered this frame (menu, console, loading), each eye gets the finished
 desktop frame instead, center-cropped to the eye's aspect ratio, so the
 2D screens stay visible in the headset.
 */
+/*
+VR_GameLoading
+
+True from the moment the server decides to load (a changelevel, a new
+game, a save being loaded, death reloading the last save) until the
+client is back in the game with the loading plaque gone. The engine
+blocks for seconds somewhere in between.
+*/
+static qboolean VR_GameLoading( void )
+{
+	if( GameState->curstate != STATE_RUNFRAME || GameState->nextstate != STATE_RUNFRAME )
+		return true; // set during the server frame that triggers the load
+	if( cls.disable_screen )
+		return true; // loading plaque up
+	if( cls.state > ca_disconnected && cls.state < ca_active )
+		return true; // connecting to the new map, precaching
+	return false;
+}
+
+/*
+VR_PausesGame
+
+Called through CL_IsInGame: singleplayer stops simulating and game sounds
+pause while it returns true, exactly like with the menu open. True while
+the session isn't focused: the headset is off or asleep, or the runtime's
+system menu is up. The game resumes by itself when focus comes back.
+*/
+qboolean VR_PausesGame( void )
+{
+	if( !vr.initialized || vr.session == XR_NULL_HANDLE || cls.state != ca_active )
+		return false;
+
+	if( vr_debug_unfocused.value )
+		return true;
+
+	return vr.session_state != XR_SESSION_STATE_FOCUSED;
+}
+
+/*
+VR_DrawLoadingScreen
+
+Black with the game's LOADING image in the middle at VR_PANEL_TEXT of
+the width, aspect kept. Runs in the renderer's 2D mode with a viewport of
+vw x vh pixels; 2D mode works in window units, so sizes are worked out
+in viewport pixels and turned into window units.
+*/
+static void VR_DrawLoadingScreen( int vw, int vh )
+{
+	int iw = 0, ih = 0;
+	float pw, ph, sx = (float)refState.width / vw, sy = (float)refState.height / vh;
+
+	vrgl.ClearColor( 0.0f, 0.0f, 0.0f, 1.0f );
+	vrgl.Clear( VR_GL_COLOR_BUFFER_BIT );
+	vrgl.Disable( VR_GL_ALPHA_TEST );
+
+	if( cls.loadingBar <= 0 )
+		return;
+
+	R_GetTextureParms( &iw, &ih, cls.loadingBar );
+	if( iw <= 0 || ih <= 0 )
+		return;
+
+	pw = vw * VR_PANEL_TEXT;
+	ph = pw * ih / iw;
+	ref.dllFuncs.Color4ub( 255, 255, 255, 255 );
+	ref.dllFuncs.GL_SetRenderMode( kRenderTransTexture );
+	ref.dllFuncs.R_DrawStretchPic(( vw - pw ) * 0.5f * sx, ( vh - ph ) * 0.5f * sy, pw * sx, ph * sy, 0, 0, 1, 1, cls.loadingBar );
+}
+
+/*
+VR_DrawDesktopLoading
+
+While the headset shows the loading panel, the desktop window shows the
+same: in VR it's normally a copy of the left eye, which would stay on the
+last world frame and never show the game's loading screen.
+*/
+static void VR_DrawDesktopLoading( void )
+{
+	qboolean scissor = vrgl.IsEnabled( VR_GL_SCISSOR_TEST );
+
+	if( refState.width <= 0 || refState.height <= 0 )
+		return;
+
+	if( scissor ) vrgl.Disable( VR_GL_SCISSOR_TEST ); // clears obey the scissor
+	ref.dllFuncs.R_Set2DMode( true ); // binds the screen and sets the window viewport
+	VR_DrawLoadingScreen( refState.width, refState.height );
+	ref.dllFuncs.R_Set2DMode( false );
+	if( scissor ) vrgl.Enable( VR_GL_SCISSOR_TEST );
+}
+
+/*
+VR_DrawPanel
+
+Draws the loading panel: black with the game's LOADING image in the
+middle. Called at the desktop swap while the game is loading, once per
+load. The desktop's own plaque isn't copied, it's the last world frame
+with LOADING on top, which floats in the dark like a photo in VR.
+*/
+static void VR_DrawPanel( void )
+{
+	XrSwapchainImageAcquireInfo acquire = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+	XrSwapchainImageWaitInfo wait = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+	XrSwapchainImageReleaseInfo release = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+	vr_GLint old_draw = 0, old_read = 0;
+	qboolean scissor, srgb;
+	uint32_t index;
+
+	if( vr.panel_valid || vr.panel_swapchain == XR_NULL_HANDLE || !vr.fbo || refState.width <= 0 || refState.height <= 0 )
+		return;
+
+	if( XR_FAILED( pxrAcquireSwapchainImage( vr.panel_swapchain, &acquire, &index )))
+		return;
+
+	wait.timeout = XR_INFINITE_DURATION;
+	if( XR_FAILED( pxrWaitSwapchainImage( vr.panel_swapchain, &wait )))
+		return;
+
+	vrgl.GetIntegerv( VR_GL_DRAW_FRAMEBUFFER_BINDING, &old_draw );
+	vrgl.GetIntegerv( VR_GL_READ_FRAMEBUFFER_BINDING, &old_read );
+	scissor = vrgl.IsEnabled( VR_GL_SCISSOR_TEST );
+	srgb = vrgl.IsEnabled( VR_GL_FRAMEBUFFER_SRGB );
+	if( scissor ) vrgl.Disable( VR_GL_SCISSOR_TEST );
+	if( srgb ) vrgl.Disable( VR_GL_FRAMEBUFFER_SRGB );
+
+	// the renderer's 2D mode maps window coordinates onto the viewport
+	ref.dllFuncs.R_Set2DMode( true );
+	vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.fbo );
+	vrgl.FramebufferTexture2D( VR_GL_FRAMEBUFFER, VR_GL_COLOR_ATTACHMENT0, VR_GL_TEXTURE_2D, vr.panel_images[index].image, 0 );
+
+	if( vrgl.CheckFramebufferStatus( VR_GL_FRAMEBUFFER ) == VR_GL_FRAMEBUFFER_COMPLETE )
+	{
+		vrgl.Viewport( 0, 0, VR_PANEL_WIDTH, VR_PANEL_HEIGHT );
+		VR_DrawLoadingScreen( VR_PANEL_WIDTH, VR_PANEL_HEIGHT );
+		vr.panel_valid = true;
+	}
+
+	ref.dllFuncs.R_Set2DMode( false );
+	vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.fbo );
+	vrgl.FramebufferTexture2D( VR_GL_FRAMEBUFFER, VR_GL_COLOR_ATTACHMENT0, VR_GL_TEXTURE_2D, 0, 0 );
+	pxrReleaseSwapchainImage( vr.panel_swapchain, &release );
+
+	vrgl.BindFramebuffer( VR_GL_DRAW_FRAMEBUFFER, old_draw );
+	vrgl.BindFramebuffer( VR_GL_READ_FRAMEBUFFER, old_read );
+	vrgl.Viewport( 0, 0, refState.width, refState.height );
+	if( scissor ) vrgl.Enable( VR_GL_SCISSOR_TEST );
+	if( srgb ) vrgl.Enable( VR_GL_FRAMEBUFFER_SRGB );
+}
+
 void VR_CopyDesktopToEyes( void )
 {
 	vr_GLint old_draw = 0, old_read = 0;
 	qboolean scissor, srgb;
 	int src_w, src_h, src_x, eye;
+
+	if( vr.running && ( VR_GameLoading( ) || vr.transition == VR_TRANSITION_LOADING || vr.transition == VR_TRANSITION_HOLD ))
+	{
+		// while the headset shows the loading panel (loading, and the hold
+		// after it) the desktop shows the same, never the head-locked copy
+		VR_DrawDesktopLoading( );
+		VR_DrawPanel( );
+		return;
+	}
 
 	if( !vr.frame_begun || !vr.should_render || !vr.views_valid || !vr.fbo || vr.eyes_written )
 		return;
@@ -1525,6 +1779,7 @@ static void VR_PrintFrameStats( void )
 		vr.frames ? vr.wait_total * 1000.0 / vr.frames : 0.0, vr.wait_max * 1000.0 );
 	Con_Printf( "VR: eyes rendered in %u frames, desktop copy in %u, empty %u\n",
 		vr.frames_rendered, vr.frames_copied, vr.frames - vr.frames_rendered - vr.frames_copied );
+	Con_Printf( "VR: loading panel submitted in %u frames\n", vr.frames_panel );
 }
 
 // the desktop mirror window must not wait for vsync while VR runs, the
@@ -1560,7 +1815,7 @@ static void VR_BeginSession( void )
 	}
 
 	vr.running = true;
-	vr.frames = vr.frames_rendered = vr.frames_copied = 0;
+	vr.frames = vr.frames_rendered = vr.frames_copied = vr.frames_panel = 0;
 	vr.wait_total = vr.wait_max = 0.0;
 	vr.begin_time = Platform_DoubleTime();
 	Con_Printf( "VR: session running\n" );
@@ -1681,10 +1936,135 @@ void VR_PollEvents( void )
 	}
 }
 
+/*
+VR_PlacePanel
+
+Puts the loading panel 2 m in front of where the head faces, level, at
+eye height, turned toward the head. It stays at that spot in the room,
+so looking around while the game is frozen behaves like the real world.
+*/
+static void VR_PlacePanel( void )
+{
+	static const XrVector3f xr_forward = { 0.0f, 0.0f, -1.0f };
+	XrVector3f head = { 0.0f, 1.6f, 0.0f }, f = { 0.0f, 0.0f, -1.0f }, axis;
+	float len, theta;
+
+	if( vr.views_valid )
+	{
+		head.x = ( vr.views[0].pose.position.x + vr.views[1].pose.position.x ) * 0.5f;
+		head.y = ( vr.views[0].pose.position.y + vr.views[1].pose.position.y ) * 0.5f;
+		head.z = ( vr.views[0].pose.position.z + vr.views[1].pose.position.z ) * 0.5f;
+
+		VR_RotateVector( &vr.views[0].pose.orientation, &xr_forward, &axis );
+		len = sqrtf( axis.x * axis.x + axis.z * axis.z );
+		if( len > 0.001f )
+		{
+			f.x = axis.x / len;
+			f.z = axis.z / len;
+		}
+	}
+
+	vr.panel_pose.position.x = head.x + f.x * VR_PANEL_DISTANCE;
+	vr.panel_pose.position.y = head.y;
+	vr.panel_pose.position.z = head.z + f.z * VR_PANEL_DISTANCE;
+
+	// a quad faces along its +Z: turn around Y so -Z points away from the head
+	theta = atan2f( -f.x, -f.z );
+	vr.panel_pose.orientation.x = 0.0f;
+	vr.panel_pose.orientation.y = sinf( theta * 0.5f );
+	vr.panel_pose.orientation.z = 0.0f;
+	vr.panel_pose.orientation.w = cosf( theta * 0.5f );
+}
+
+static void VR_SetTransition( int transition, double now )
+{
+	vr.transition = transition;
+	vr.transition_time = now;
+	vr.hold_frames = 0;
+}
+
+/*
+VR_UpdateTransition
+
+Once per submitted frame, decides what the headset gets:
+
+NONE     playing: the eyes.
+LOADING  from the frame that triggers a load until the game is back:
+         only the loading panel (or nothing, if it couldn't be drawn).
+         The last frame before the engine blocks is a panel frame, so
+         while the engine is frozen the runtime keeps drawing a
+         world-locked panel with fresh head tracking, never a stuck world.
+HOLD     loaded: the eyes are drawn again but the panel stays for a few
+         frames, so the hitches of the first frames stay hidden.
+FADEIN   the eyes are submitted, fading in from black over vr_loadfade.
+
+Starting a load cuts straight to the panel: the server has already
+switched levels by then, there's no frame left to fade out in.
+*/
+static void VR_UpdateTransition( void )
+{
+	double now = Platform_DoubleTime(), dt = now - vr.transition_last;
+	qboolean loading = VR_GameLoading( ), paused = VR_PausesGame( );
+
+	vr.transition_last = now;
+
+	if( paused != vr.game_paused )
+	{
+		vr.game_paused = paused;
+		Con_Printf( "VR: %s\n", paused ? "the headset lost focus, game paused" : "the headset has focus again, game resumed" );
+	}
+
+	if( loading && vr.transition != VR_TRANSITION_LOADING )
+	{
+		if( vr.transition == VR_TRANSITION_NONE )
+			VR_PlacePanel( );
+		Con_Printf( "VR: loading, the headset shows the loading panel\n" );
+		VR_SetTransition( VR_TRANSITION_LOADING, now );
+		vr.load_fade = 0.0f;
+		return;
+	}
+
+	switch( vr.transition )
+	{
+	case VR_TRANSITION_LOADING:
+		if( !loading )
+		{
+			Con_Printf( "VR: loaded in %.2f s\n", now - vr.transition_time );
+			VR_SetTransition( VR_TRANSITION_HOLD, now );
+		}
+		break;
+	case VR_TRANSITION_HOLD:
+		if( vr.eyes_written )
+			vr.hold_frames++;
+
+		if( vr.hold_frames >= VR_HOLD_FRAMES && now - vr.transition_time >= VR_HOLD_TIME )
+		{
+			VR_SetTransition( VR_TRANSITION_FADEIN, now );
+			vr.load_fade = vr_loadfade.value > 0.0f ? 1.0f : 0.0f;
+		}
+		break;
+	case VR_TRANSITION_FADEIN:
+		if( vr_loadfade.value > 0.0f )
+			vr.load_fade -= dt / vr_loadfade.value;
+		else vr.load_fade = 0.0f;
+
+		if( vr.load_fade <= 0.0f )
+		{
+			vr.load_fade = 0.0f;
+			vr.panel_valid = false; // the next load draws it again
+			VR_SetTransition( VR_TRANSITION_NONE, now );
+		}
+		break;
+	default:
+		break;
+	}
+}
+
 static void VR_SubmitFrame( void )
 {
 	XrFrameEndInfo info = { XR_TYPE_FRAME_END_INFO };
 	XrCompositionLayerProjection layer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+	XrCompositionLayerQuad quad = { XR_TYPE_COMPOSITION_LAYER_QUAD };
 	XrCompositionLayerProjectionView views[2];
 	const XrCompositionLayerBaseHeader *layers[1];
 	XrResult result;
@@ -1693,14 +2073,37 @@ static void VR_SubmitFrame( void )
 	if( !vr.frame_begun )
 		return;
 
+	VR_UpdateTransition( );
+
 	info.displayTime = vr.display_time;
 	info.environmentBlendMode = vr.blend_mode;
 	info.layerCount = 0;
 	info.layers = NULL;
 
-	// a frame where the eyes weren't filled (loading, shouldRender false)
-	// goes out with no layers; the runtime keeps showing its last image
-	if( vr.eyes_written )
+	if( vr.transition == VR_TRANSITION_LOADING || vr.transition == VR_TRANSITION_HOLD )
+	{
+		// opaque quad on black, placed in the room; if it couldn't be drawn
+		// the frame goes out empty
+		if( vr.panel_valid )
+		{
+			quad.space = vr.space;
+			quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+			quad.subImage.swapchain = vr.panel_swapchain;
+			quad.subImage.imageRect.extent.width = VR_PANEL_WIDTH;
+			quad.subImage.imageRect.extent.height = VR_PANEL_HEIGHT;
+			quad.pose = vr.panel_pose;
+			quad.size.width = VR_PANEL_METRES;
+			quad.size.height = VR_PANEL_METRES * VR_PANEL_HEIGHT / VR_PANEL_WIDTH;
+			layers[0] = (const XrCompositionLayerBaseHeader *)&quad;
+
+			info.layerCount = 1;
+			info.layers = layers;
+			vr.frames_panel++;
+		}
+	}
+	// a frame where the eyes weren't filled (menus before the first copy,
+	// shouldRender false) goes out with no layers
+	else if( vr.eyes_written )
 	{
 		for( eye = 0; eye < 2; eye++ )
 		{
@@ -1812,6 +2215,11 @@ static void VR_Info_f( void )
 	if( vr.running )
 		VR_PrintFrameStats( );
 
+	{
+		static const char *names[] = { "playing", "loading (panel)", "loaded, holding the panel", "fading in" };
+		Con_Printf( "VR: %s, game %s\n", names[bound( 0, vr.transition, 3 )], vr.game_paused ? "paused (no focus)" : "running" );
+	}
+
 	Con_Printf( "VR: room scale %s, player at %.1f %.1f %.1f yaw %.0f, head %.1f units away, wall fade %.2f\n",
 		vr_roomscale.value ? "on" : "off", cl.simorg[0], cl.simorg[1], cl.simorg[2], cl.viewangles[YAW],
 		sqrtf( vr.room_gap[0] * vr.room_gap[0] + vr.room_gap[1] * vr.room_gap[1] ), vr.fade );
@@ -1893,6 +2301,8 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_handweapon );
 	Cvar_RegisterVariable( &vr_viewmodel_grip );
 	Cvar_RegisterVariable( &vr_debug_headmove );
+	Cvar_RegisterVariable( &vr_loadfade );
+	Cvar_RegisterVariable( &vr_debug_unfocused );
 	Cmd_AddCommand( "vr_recenter", VR_Recenter_f, "put the player back under the real head" );
 
 	if( !Sys_CheckParm( "-vr" ))

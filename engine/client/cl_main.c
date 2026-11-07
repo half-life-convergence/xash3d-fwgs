@@ -129,6 +129,11 @@ qboolean CL_IsInGame( void )
 	if( cl.background || cl.maxclients > 1 )
 		return true; // always active for multiplayer or background map
 
+#if XASH_OPENXR
+	if( VR_PausesGame( ))
+		return false; // headset off or its system menu open, pause like the menu does
+#endif
+
 	return ( cls.key_dest == key_game ); // active if not menu or console
 }
 
