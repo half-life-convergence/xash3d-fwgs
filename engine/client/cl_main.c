@@ -3907,6 +3907,11 @@ void Host_ClientFrame( void )
 {
 	// if client is not active, do nothing
 	if( !cls.initialized ) return;
+
+#if XASH_OPENXR
+	VR_PollEvents();
+#endif
+
 	if( cls.key_dest == key_game && cls.state == ca_active && !Con_Visible() )
 		Platform_SetTimer( cl_maxframetime.value );
 

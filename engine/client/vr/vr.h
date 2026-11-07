@@ -25,6 +25,9 @@ void VR_Init( void );
 void VR_Shutdown( void );
 qboolean VR_Active( void );
 
+// called at the start of every client frame, never blocks
+void VR_PollEvents( void );
+
 #endif // XASH_OPENXR
 
 #endif // VR_H

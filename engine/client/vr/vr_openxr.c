@@ -23,7 +23,14 @@ GNU General Public License for more details.
 // the loader is opened in runtime, so only xrGetInstanceProcAddr is linked
 // by name and everything else is fetched through it
 #define XR_NO_PROTOTYPES 1
+#if XASH_WIN32
+#include <windows.h>
+#include <unknwn.h> // IUnknown, used by openxr_platform.h on win32
+#define XR_USE_PLATFORM_WIN32 1
+#endif
+#define XR_USE_GRAPHICS_API_OPENGL 1
 #include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
 #include <openxr/openxr_reflection.h>
 
 #define VR_OPENGL_EXTENSION "XR_KHR_opengl_enable"
@@ -36,6 +43,13 @@ static PFN_xrGetInstanceProperties                pxrGetInstanceProperties;
 static PFN_xrGetSystem                            pxrGetSystem;
 static PFN_xrGetSystemProperties                  pxrGetSystemProperties;
 static PFN_xrEnumerateViewConfigurationViews      pxrEnumerateViewConfigurationViews;
+static PFN_xrGetOpenGLGraphicsRequirementsKHR     pxrGetOpenGLGraphicsRequirementsKHR;
+static PFN_xrCreateSession                        pxrCreateSession;
+static PFN_xrDestroySession                       pxrDestroySession;
+static PFN_xrEnumerateReferenceSpaces             pxrEnumerateReferenceSpaces;
+static PFN_xrCreateReferenceSpace                 pxrCreateReferenceSpace;
+static PFN_xrDestroySpace                         pxrDestroySpace;
+static PFN_xrPollEvent                            pxrPollEvent;
 
 static const dllfunc_t openxr_loader_funcs[] =
 {
@@ -64,7 +78,23 @@ static struct
 	XrSystemId system;
 	uint32_t   eye_width; // recommended per-eye render size
 	uint32_t   eye_height;
+
+	XrSession      session;
+	XrSessionState session_state;
+	XrSpace        space; // world origin, STAGE when the runtime has it, else LOCAL
+	XrReferenceSpaceType space_type;
 } vr;
+
+static const char *VR_SessionStateString( XrSessionState state )
+{
+	switch( state )
+	{
+#define VR_STATE_CASE( name, value ) case name: return #name;
+	XR_LIST_ENUM_XrSessionState( VR_STATE_CASE )
+#undef VR_STATE_CASE
+	default: return "unknown";
+	}
+}
 
 // works without an instance, unlike xrResultToString
 static const char *VR_ResultString( XrResult result )
@@ -170,7 +200,14 @@ static qboolean VR_CreateInstance( void )
 		|| !VR_GET_PROC( vr.instance, xrGetInstanceProperties )
 		|| !VR_GET_PROC( vr.instance, xrGetSystem )
 		|| !VR_GET_PROC( vr.instance, xrGetSystemProperties )
-		|| !VR_GET_PROC( vr.instance, xrEnumerateViewConfigurationViews ))
+		|| !VR_GET_PROC( vr.instance, xrEnumerateViewConfigurationViews )
+		|| !VR_GET_PROC( vr.instance, xrGetOpenGLGraphicsRequirementsKHR )
+		|| !VR_GET_PROC( vr.instance, xrCreateSession )
+		|| !VR_GET_PROC( vr.instance, xrDestroySession )
+		|| !VR_GET_PROC( vr.instance, xrEnumerateReferenceSpaces )
+		|| !VR_GET_PROC( vr.instance, xrCreateReferenceSpace )
+		|| !VR_GET_PROC( vr.instance, xrDestroySpace )
+		|| !VR_GET_PROC( vr.instance, xrPollEvent ))
 		return false;
 
 	if( XR_SUCCEEDED( pxrGetInstanceProperties( vr.instance, &props )))
@@ -233,6 +270,164 @@ static qboolean VR_GetSystem( void )
 	return true;
 }
 
+static qboolean VR_CreateSession( void )
+{
+	XrGraphicsRequirementsOpenGLKHR reqs = { XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_KHR };
+	XrSessionCreateInfo info = { XR_TYPE_SESSION_CREATE_INFO };
+	XrResult result;
+
+	// the runtime refuses to create a session before this is called
+	result = pxrGetOpenGLGraphicsRequirementsKHR( vr.instance, vr.system, &reqs );
+	if( XR_FAILED( result ))
+	{
+		Con_Printf( S_ERROR "VR: xrGetOpenGLGraphicsRequirementsKHR failed: %s\n", VR_ResultString( result ));
+		return false;
+	}
+
+	Con_Reportf( "VR: runtime wants OpenGL %u.%u to %u.%u\n",
+		XR_VERSION_MAJOR( reqs.minApiVersionSupported ), XR_VERSION_MINOR( reqs.minApiVersionSupported ),
+		XR_VERSION_MAJOR( reqs.maxApiVersionSupported ), XR_VERSION_MINOR( reqs.maxApiVersionSupported ));
+
+#if XASH_WIN32
+	{
+		// VID_Init has made the engine's GL context current on this thread,
+		// it lives until R_Shutdown, which runs after VR_Shutdown
+		XrGraphicsBindingOpenGLWin32KHR binding = { XR_TYPE_GRAPHICS_BINDING_OPENGL_WIN32_KHR };
+
+		binding.hDC = wglGetCurrentDC();
+		binding.hGLRC = wglGetCurrentContext();
+
+		if( !binding.hDC || !binding.hGLRC )
+		{
+			Con_Printf( S_ERROR "VR: no current OpenGL context, VR needs the GL renderer\n" );
+			return false;
+		}
+
+		info.next = &binding;
+		info.systemId = vr.system;
+		result = pxrCreateSession( vr.instance, &info, &vr.session );
+	}
+#else
+	Con_Printf( S_ERROR "VR: OpenGL session binding is only implemented for Windows yet\n" );
+	return false;
+#endif
+
+	if( XR_FAILED( result ))
+	{
+		vr.session = XR_NULL_HANDLE;
+		Con_Printf( S_ERROR "VR: xrCreateSession failed: %s\n", VR_ResultString( result ));
+		return false;
+	}
+
+	vr.session_state = XR_SESSION_STATE_UNKNOWN;
+	return true;
+}
+
+static qboolean VR_CreateSpace( void )
+{
+	XrReferenceSpaceCreateInfo info = { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+	XrReferenceSpaceType types[8];
+	uint32_t count = 0, i;
+	XrResult result;
+
+	// STAGE has its origin on the floor in the middle of the play area,
+	// which is what room scale wants; LOCAL (origin at the starting head
+	// position) is the fallback every runtime must have
+	vr.space_type = XR_REFERENCE_SPACE_TYPE_LOCAL;
+	if( XR_SUCCEEDED( pxrEnumerateReferenceSpaces( vr.session, ARRAYSIZE( types ), &count, types )))
+	{
+		for( i = 0; i < count; i++ )
+		{
+			if( types[i] == XR_REFERENCE_SPACE_TYPE_STAGE )
+				vr.space_type = XR_REFERENCE_SPACE_TYPE_STAGE;
+		}
+	}
+
+	info.referenceSpaceType = vr.space_type;
+	info.poseInReferenceSpace.orientation.w = 1.0f; // identity
+
+	result = pxrCreateReferenceSpace( vr.session, &info, &vr.space );
+	if( XR_FAILED( result ))
+	{
+		vr.space = XR_NULL_HANDLE;
+		Con_Printf( S_ERROR "VR: xrCreateReferenceSpace failed: %s\n", VR_ResultString( result ));
+		return false;
+	}
+
+	Con_Printf( "VR: session created, %s reference space\n",
+		vr.space_type == XR_REFERENCE_SPACE_TYPE_STAGE ? "STAGE" : "LOCAL" );
+	return true;
+}
+
+static void VR_DestroySession( void )
+{
+	if( vr.space != XR_NULL_HANDLE )
+		pxrDestroySpace( vr.space );
+
+	if( vr.session != XR_NULL_HANDLE )
+		pxrDestroySession( vr.session );
+
+	vr.space = XR_NULL_HANDLE;
+	vr.session = XR_NULL_HANDLE;
+	vr.session_state = XR_SESSION_STATE_UNKNOWN;
+}
+
+static void VR_HandleSessionState( const XrEventDataSessionStateChanged *ev )
+{
+	vr.session_state = ev->state;
+	Con_Reportf( "VR: session state %s\n", VR_SessionStateString( ev->state ));
+
+	switch( ev->state )
+	{
+	case XR_SESSION_STATE_READY:
+		// xrBeginSession and the xrWaitFrame/xrBeginFrame/xrEndFrame loop
+		// come with the frame loop card, until then the session idles here
+		break;
+	case XR_SESSION_STATE_EXITING:
+	case XR_SESSION_STATE_LOSS_PENDING:
+		// the runtime is going away or asked us to quit VR, go back to desktop
+		Con_Printf( "VR: session ended by the runtime (%s), VR disabled\n", VR_SessionStateString( ev->state ));
+		VR_Shutdown( );
+		break;
+	default:
+		break;
+	}
+}
+
+void VR_PollEvents( void )
+{
+	XrEventDataBuffer ev;
+
+	if( !vr.initialized )
+		return;
+
+	// non-blocking, drains whatever the runtime queued since last frame
+	while( vr.instance != XR_NULL_HANDLE )
+	{
+		ev.type = XR_TYPE_EVENT_DATA_BUFFER;
+		ev.next = NULL;
+
+		if( pxrPollEvent( vr.instance, &ev ) != XR_SUCCESS )
+			break;
+
+		switch( ev.type )
+		{
+		case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED:
+			VR_HandleSessionState( (const XrEventDataSessionStateChanged *)&ev );
+			break;
+		case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
+			Con_Printf( "VR: OpenXR runtime is shutting down, VR disabled\n" );
+			VR_Shutdown( );
+			break;
+		case XR_TYPE_EVENT_DATA_EVENTS_LOST:
+			Con_Printf( S_WARN "VR: lost %u OpenXR events\n", ((const XrEventDataEventsLost *)&ev )->lostEventCount );
+			break;
+		default:
+			break;
+		}
+	}
+}
+
 static void VR_Info_f( void )
 {
 	if( !vr.initialized )
@@ -241,7 +436,9 @@ static void VR_Info_f( void )
 		return;
 	}
 
-	Con_Printf( "VR: active, eye size %ux%u\n", vr.eye_width, vr.eye_height );
+	Con_Printf( "VR: active, eye size %ux%u, session %s, %s space\n", vr.eye_width, vr.eye_height,
+		VR_SessionStateString( vr.session_state ),
+		vr.space_type == XR_REFERENCE_SPACE_TYPE_STAGE ? "STAGE" : "LOCAL" );
 }
 
 qboolean VR_Active( void )
@@ -262,7 +459,7 @@ void VR_Init( void )
 		return;
 	}
 
-	if( !VR_CreateInstance( ) || !VR_GetSystem( ))
+	if( !VR_CreateInstance( ) || !VR_GetSystem( ) || !VR_CreateSession( ) || !VR_CreateSpace( ))
 	{
 		VR_Shutdown( );
 		return;
@@ -274,6 +471,9 @@ void VR_Init( void )
 
 void VR_Shutdown( void )
 {
+	if( vr.instance != XR_NULL_HANDLE )
+		VR_DestroySession( );
+
 	if( vr.instance != XR_NULL_HANDLE && pxrDestroyInstance )
 		pxrDestroyInstance( vr.instance );
 

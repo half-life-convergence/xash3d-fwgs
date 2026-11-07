@@ -83,6 +83,8 @@ def find_openxr(conf):
 
 	conf.check_cc(header_name = 'openxr/openxr.h', includes = includes, msg = 'Checking for OpenXR headers')
 	conf.env.INCLUDES_OPENXR = includes
+	if conf.env.DEST_OS == 'win32':
+		conf.env.LIB_OPENXR = ['opengl32'] # wglGetCurrentDC/Context for the session binding
 	conf.env.OPENXR = True
 	conf.define('XASH_OPENXR', 1)
 
@@ -334,7 +336,7 @@ def build(bld):
 				libs += ['GIO', 'AUDIORESOURCE', 'WAYLAND_CLIENT']
 
 			if bld.env.OPENXR:
-				libs += ['OPENXR'] # headers only, the loader is opened in runtime
+				libs += ['OPENXR'] # the loader itself is opened in runtime
 				if bld.env.OPENXR_LOADER: # only set for win32 by find_openxr
 					bld.install_files(bld.env.BINDIR, bld.root.find_node(bld.env.OPENXR_LOADER))
 
