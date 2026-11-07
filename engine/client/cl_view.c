@@ -396,6 +396,9 @@ void V_RenderView( void )
 	static ref_params_t	rp;
 	ref_viewpass_t	rvp;
 	int		viewnum = 0;
+#if XASH_OPENXR
+	int		eyes;
+#endif
 
 	if( !cl.video_prepped || ( !ui_renderworld.value && UI_IsVisible() && !cl.background ))
 		return; // still loading
@@ -426,9 +429,8 @@ void V_RenderView( void )
 		}
 
 #if XASH_OPENXR
+		eyes = VR_EYES_NONE;
 		{
-			int eyes = VR_EYES_NONE;
-
 			// eyes first, so the renderer ends the frame in the desktop view's state;
 			// with a menu up the headset gets the desktop copy instead (VR_CopyDesktopToEyes)
 			if( viewnum == 0 && !FBitSet( rvp.flags, RF_ONLY_CLIENTDRAW ) && !UI_IsVisible( ))
@@ -448,10 +450,20 @@ void V_RenderView( void )
 				GL_RenderFrame( &rvp );
 			}
 		}
+
+		if( eyes != VR_EYES_NONE )
+		{
+			// hear from the real head, not from the body camera
+			ref_viewpass_t listener = rvp;
+
+			VR_ListenerView( &listener );
+			S_UpdateFrame( &listener );
+		}
+		else S_UpdateFrame( &rvp );
 #else
 		GL_RenderFrame( &rvp );
-#endif
 		S_UpdateFrame( &rvp );
+#endif
 		viewnum++;
 
 	} while( rp.nextView );

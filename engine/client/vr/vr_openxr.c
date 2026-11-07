@@ -23,6 +23,7 @@ GNU General Public License for more details.
 #include "ref_common.h" // refState, the window size
 #include "const.h" // kRenderTransTexture
 #include "pm_local.h" // PM_CL_TraceLine flags
+#include "sound.h" // snd.origin, the listener, for vr_info
 #if XASH_SDL == 2
 #include <SDL.h> // SDL_GL_SetSwapInterval for the desktop mirror window
 #endif
@@ -186,6 +187,10 @@ static struct
 	qboolean hand_valid[2];
 	vec3_t   hand_origin[2];
 	vec3_t   hand_angles[2];
+
+	// the head center in the world, this frame, for the sound listener
+	vec3_t   head_origin;
+	vec3_t   head_angles;
 
 	uint32_t frames; // frames submitted since the session began
 	uint32_t frames_rendered; // ... of which the renderer drew the eyes
@@ -1291,6 +1296,35 @@ int VR_RenderEyes( const ref_viewpass_t *rvp )
 	}
 	VR_UpdateHands( rvp, head );
 	{
+		// the listener sits between the eyes and faces where the head faces:
+		// the eye positions averaged, the eye orientations blended (equal on
+		// most headsets, canted displays tilt them apart a little)
+		const XrQuaternionf *a = &vr.views[0].pose.orientation, *b = &vr.views[1].pose.orientation;
+		float sign = ( a->x * b->x + a->y * b->y + a->z * b->z + a->w * b->w ) < 0.0f ? -1.0f : 1.0f;
+		XrPosef center;
+		float len;
+
+		center.position.x = ( vr.views[0].pose.position.x + vr.views[1].pose.position.x ) * 0.5f;
+		center.position.y = ( vr.views[0].pose.position.y + vr.views[1].pose.position.y ) * 0.5f;
+		center.position.z = ( vr.views[0].pose.position.z + vr.views[1].pose.position.z ) * 0.5f;
+		center.orientation.x = a->x + sign * b->x;
+		center.orientation.y = a->y + sign * b->y;
+		center.orientation.z = a->z + sign * b->z;
+		center.orientation.w = a->w + sign * b->w;
+		len = sqrtf( center.orientation.x * center.orientation.x + center.orientation.y * center.orientation.y
+			+ center.orientation.z * center.orientation.z + center.orientation.w * center.orientation.w );
+		if( len > 0.0001f )
+		{
+			center.orientation.x /= len;
+			center.orientation.y /= len;
+			center.orientation.z /= len;
+			center.orientation.w /= len;
+		}
+		else center.orientation = *a;
+
+		VR_EyeView( rvp, &center, head, vr.head_origin, vr.head_angles );
+	}
+	{
 		// the head's place in the world, for the wall check
 		float yaw = DEG2RAD( rvp->viewangles[YAW] );
 		vec3_t feet, turned, local = { 0.0f, 0.0f, head[2] };
@@ -1793,6 +1827,10 @@ static void VR_Info_f( void )
 					vr.hand_angles[hand][0], vr.hand_angles[hand][1], vr.hand_angles[hand][2] );
 			else Con_Printf( "VR: %s hand not tracked\n", hand ? "right" : "left" );
 		}
+		Con_Printf( "VR: head at %.1f %.1f %.1f facing %.0f %.0f %.0f, sound listener at %.1f %.1f %.1f\n",
+			vr.head_origin[0], vr.head_origin[1], vr.head_origin[2],
+			vr.head_angles[0], vr.head_angles[1], vr.head_angles[2],
+			snd.origin[0], snd.origin[1], snd.origin[2] );
 		Con_Printf( "VR: weapon model at %.1f %.1f %.1f\n", clgame.viewent.origin[0], clgame.viewent.origin[1], clgame.viewent.origin[2] );
 		Con_Printf( "VR: last command aims %.0f %.0f, body yaw %.0f, gun start %s %.1f %.1f %.1f from the player\n",
 			cl.cmd.viewangles[PITCH], cl.cmd.viewangles[YAW], cl.viewangles[YAW],
@@ -1819,6 +1857,13 @@ qboolean VR_SessionFocused( void )
 float VR_HeadYaw( void )
 {
 	return vr.head_yaw;
+}
+
+void VR_ListenerView( struct ref_viewpass_s *rvp )
+{
+	// only called for frames whose eyes were drawn, so the head is fresh
+	VectorCopy( vr.head_origin, rvp->vieworigin );
+	VectorCopy( vr.head_angles, rvp->viewangles );
 }
 
 qboolean VR_RightHandAim( vec3_t origin, vec3_t angles )

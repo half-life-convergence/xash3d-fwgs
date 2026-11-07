@@ -49,6 +49,11 @@ qboolean VR_PacesFrames( void );
 struct ref_viewpass_s;
 int VR_RenderEyes( const struct ref_viewpass_s *rvp );
 
+// for frames whose eyes were drawn: puts the head center's position and
+// orientation (between the eyes, facing where the head faces) into rvp,
+// so the sound listener follows the real head instead of the body camera
+void VR_ListenerView( struct ref_viewpass_s *rvp );
+
 // room scale, called by CL_CreateCmd and after the first prediction of a
 // command: the request rides in usercmd_t.impact_position, pm_shared
 // writes back how far the player really moved
