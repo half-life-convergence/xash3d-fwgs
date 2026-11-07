@@ -40,6 +40,10 @@ void VR_EndFrame( void );
 // SteamVR doesn't throttle xrWaitFrame for frames without layers.
 qboolean VR_PacesFrames( void );
 
+// called by the renderer's buffer swap, before the desktop window swaps:
+// copies the finished frame into the eye swapchains
+void VR_CopyDesktopToEyes( void );
+
 #endif // XASH_OPENXR
 
 #endif // VR_H

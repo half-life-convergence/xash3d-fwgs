@@ -20,6 +20,7 @@ GNU General Public License for more details.
 
 #include "vr.h"
 #include "platform/platform.h"
+#include "ref_common.h" // refState, the window size
 #if XASH_SDL == 2
 #include <SDL.h> // SDL_GL_SetSwapInterval for the desktop mirror window
 #endif
@@ -60,6 +61,52 @@ static PFN_xrEndSession                           pxrEndSession;
 static PFN_xrWaitFrame                            pxrWaitFrame;
 static PFN_xrBeginFrame                           pxrBeginFrame;
 static PFN_xrEndFrame                             pxrEndFrame;
+static PFN_xrLocateViews                          pxrLocateViews;
+static PFN_xrEnumerateSwapchainFormats            pxrEnumerateSwapchainFormats;
+static PFN_xrCreateSwapchain                      pxrCreateSwapchain;
+static PFN_xrDestroySwapchain                     pxrDestroySwapchain;
+static PFN_xrEnumerateSwapchainImages             pxrEnumerateSwapchainImages;
+static PFN_xrAcquireSwapchainImage                pxrAcquireSwapchainImage;
+static PFN_xrWaitSwapchainImage                   pxrWaitSwapchainImage;
+static PFN_xrReleaseSwapchainImage                pxrReleaseSwapchainImage;
+
+// the few GL entry points the VR layer needs itself, loaded through
+// GL_GetProcAddress so the engine doesn't depend on GL headers
+#ifndef APIENTRY
+#define APIENTRY
+#endif
+typedef unsigned int vr_GLuint;
+typedef unsigned int vr_GLenum;
+typedef int          vr_GLint;
+typedef unsigned char vr_GLboolean;
+
+#define VR_GL_TEXTURE_2D                0x0DE1
+#define VR_GL_SCISSOR_TEST              0x0C11
+#define VR_GL_LINEAR                    0x2601
+#define VR_GL_COLOR_BUFFER_BIT          0x4000
+#define VR_GL_RGBA8                     0x8058
+#define VR_GL_SRGB8_ALPHA8              0x8C43
+#define VR_GL_DRAW_FRAMEBUFFER_BINDING  0x8CA6
+#define VR_GL_READ_FRAMEBUFFER          0x8CA8
+#define VR_GL_DRAW_FRAMEBUFFER          0x8CA9
+#define VR_GL_READ_FRAMEBUFFER_BINDING  0x8CAA
+#define VR_GL_FRAMEBUFFER_COMPLETE      0x8CD5
+#define VR_GL_COLOR_ATTACHMENT0         0x8CE0
+#define VR_GL_FRAMEBUFFER_SRGB          0x8DB9
+
+static struct
+{
+	void (APIENTRY *GenFramebuffers)( int n, vr_GLuint *ids );
+	void (APIENTRY *DeleteFramebuffers)( int n, const vr_GLuint *ids );
+	void (APIENTRY *BindFramebuffer)( vr_GLenum target, vr_GLuint id );
+	void (APIENTRY *FramebufferTexture2D)( vr_GLenum target, vr_GLenum attachment, vr_GLenum textarget, vr_GLuint texture, vr_GLint level );
+	vr_GLenum (APIENTRY *CheckFramebufferStatus)( vr_GLenum target );
+	void (APIENTRY *BlitFramebuffer)( vr_GLint sx0, vr_GLint sy0, vr_GLint sx1, vr_GLint sy1, vr_GLint dx0, vr_GLint dy0, vr_GLint dx1, vr_GLint dy1, unsigned int mask, vr_GLenum filter );
+	void (APIENTRY *GetIntegerv)( vr_GLenum pname, vr_GLint *data );
+	vr_GLboolean (APIENTRY *IsEnabled)( vr_GLenum cap );
+	void (APIENTRY *Enable)( vr_GLenum cap );
+	void (APIENTRY *Disable)( vr_GLenum cap );
+} vrgl;
 
 static const dllfunc_t openxr_loader_funcs[] =
 {
@@ -103,6 +150,17 @@ static struct
 	qboolean should_render;
 	qboolean submits_layers; // set once eye images are submitted, see VR_UpdatePacing
 	qboolean paced; // xrWaitFrame is the frame limiter right now
+	// one color swapchain per eye
+	XrSwapchain swapchain[2];
+	XrSwapchainImageOpenGLKHR *images[2];
+	uint32_t    num_images[2];
+	int64_t     swapchain_format;
+	vr_GLuint   fbo; // draw target for copying into swapchain images
+
+	XrView   views[2]; // eye poses and fovs at display_time
+	qboolean views_valid;
+	qboolean eyes_written; // both eye images were filled this frame
+
 	uint32_t frames; // frames submitted since the session began
 	double   begin_time;
 	double   wait_total; // seconds spent blocked in xrWaitFrame
@@ -238,7 +296,15 @@ static qboolean VR_CreateInstance( void )
 		|| !VR_GET_PROC( vr.instance, xrEndSession )
 		|| !VR_GET_PROC( vr.instance, xrWaitFrame )
 		|| !VR_GET_PROC( vr.instance, xrBeginFrame )
-		|| !VR_GET_PROC( vr.instance, xrEndFrame ))
+		|| !VR_GET_PROC( vr.instance, xrEndFrame )
+		|| !VR_GET_PROC( vr.instance, xrLocateViews )
+		|| !VR_GET_PROC( vr.instance, xrEnumerateSwapchainFormats )
+		|| !VR_GET_PROC( vr.instance, xrCreateSwapchain )
+		|| !VR_GET_PROC( vr.instance, xrDestroySwapchain )
+		|| !VR_GET_PROC( vr.instance, xrEnumerateSwapchainImages )
+		|| !VR_GET_PROC( vr.instance, xrAcquireSwapchainImage )
+		|| !VR_GET_PROC( vr.instance, xrWaitSwapchainImage )
+		|| !VR_GET_PROC( vr.instance, xrReleaseSwapchainImage ))
 		return false;
 
 	if( XR_SUCCEEDED( pxrGetInstanceProperties( vr.instance, &props )))
@@ -402,6 +468,232 @@ static qboolean VR_CreateSpace( void )
 	return true;
 }
 
+static qboolean VR_LoadGL( void )
+{
+	static const struct { const char *name; void **func; } funcs[] =
+	{
+		{ "glGenFramebuffers", (void **)&vrgl.GenFramebuffers },
+		{ "glDeleteFramebuffers", (void **)&vrgl.DeleteFramebuffers },
+		{ "glBindFramebuffer", (void **)&vrgl.BindFramebuffer },
+		{ "glFramebufferTexture2D", (void **)&vrgl.FramebufferTexture2D },
+		{ "glCheckFramebufferStatus", (void **)&vrgl.CheckFramebufferStatus },
+		{ "glBlitFramebuffer", (void **)&vrgl.BlitFramebuffer },
+		{ "glGetIntegerv", (void **)&vrgl.GetIntegerv },
+		{ "glIsEnabled", (void **)&vrgl.IsEnabled },
+		{ "glEnable", (void **)&vrgl.Enable },
+		{ "glDisable", (void **)&vrgl.Disable },
+	};
+	size_t i;
+
+	for( i = 0; i < ARRAYSIZE( funcs ); i++ )
+	{
+		*funcs[i].func = GL_GetProcAddress( funcs[i].name );
+		if( !*funcs[i].func )
+		{
+			Con_Printf( S_ERROR "VR: OpenGL function %s is missing\n", funcs[i].name );
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static int64_t VR_PickSwapchainFormat( void )
+{
+	// the engine draws gamma-encoded colors without GL_FRAMEBUFFER_SRGB, so
+	// an sRGB swapchain stores them as-is and the runtime decodes them right
+	static const int64_t wanted[] = { VR_GL_SRGB8_ALPHA8, VR_GL_RGBA8 };
+	int64_t formats[64];
+	uint32_t count = 0, i, j;
+
+	if( XR_FAILED( pxrEnumerateSwapchainFormats( vr.session, ARRAYSIZE( formats ), &count, formats )))
+		return 0;
+
+	for( j = 0; j < ARRAYSIZE( wanted ); j++ )
+	{
+		for( i = 0; i < count; i++ )
+		{
+			if( formats[i] == wanted[j] )
+				return wanted[j];
+		}
+	}
+
+	return 0;
+}
+
+static qboolean VR_CreateSwapchains( void )
+{
+	int eye;
+
+	if( !VR_LoadGL( ))
+		return false;
+
+	vr.swapchain_format = VR_PickSwapchainFormat( );
+	if( !vr.swapchain_format )
+	{
+		Con_Printf( S_ERROR "VR: runtime offers no RGBA8 or SRGB8_ALPHA8 swapchain format\n" );
+		return false;
+	}
+
+	for( eye = 0; eye < 2; eye++ )
+	{
+		XrSwapchainCreateInfo info = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+		XrResult result;
+		uint32_t i;
+
+		info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+		info.format = vr.swapchain_format;
+		info.sampleCount = 1;
+		info.width = vr.eye_width;
+		info.height = vr.eye_height;
+		info.faceCount = 1;
+		info.arraySize = 1;
+		info.mipCount = 1;
+
+		result = pxrCreateSwapchain( vr.session, &info, &vr.swapchain[eye] );
+		if( XR_FAILED( result ))
+		{
+			vr.swapchain[eye] = XR_NULL_HANDLE;
+			Con_Printf( S_ERROR "VR: xrCreateSwapchain failed: %s\n", VR_ResultString( result ));
+			return false;
+		}
+
+		pxrEnumerateSwapchainImages( vr.swapchain[eye], 0, &vr.num_images[eye], NULL );
+		vr.images[eye] = Mem_Calloc( host.mempool, sizeof( *vr.images[eye] ) * vr.num_images[eye] );
+		for( i = 0; i < vr.num_images[eye]; i++ )
+			vr.images[eye][i].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
+
+		result = pxrEnumerateSwapchainImages( vr.swapchain[eye], vr.num_images[eye], &vr.num_images[eye],
+			(XrSwapchainImageBaseHeader *)vr.images[eye] );
+		if( XR_FAILED( result ))
+		{
+			Con_Printf( S_ERROR "VR: xrEnumerateSwapchainImages failed: %s\n", VR_ResultString( result ));
+			return false;
+		}
+	}
+
+	vrgl.GenFramebuffers( 1, &vr.fbo );
+
+	Con_Printf( "VR: eye swapchains %ux%u, %s, %u images each\n", vr.eye_width, vr.eye_height,
+		vr.swapchain_format == VR_GL_SRGB8_ALPHA8 ? "SRGB8_ALPHA8" : "RGBA8", vr.num_images[0] );
+	return true;
+}
+
+static void VR_DestroySwapchains( void )
+{
+	int eye;
+
+	if( vr.fbo && vrgl.DeleteFramebuffers )
+		vrgl.DeleteFramebuffers( 1, &vr.fbo );
+	vr.fbo = 0;
+
+	for( eye = 0; eye < 2; eye++ )
+	{
+		if( vr.swapchain[eye] != XR_NULL_HANDLE )
+			pxrDestroySwapchain( vr.swapchain[eye] );
+		vr.swapchain[eye] = XR_NULL_HANDLE;
+
+		if( vr.images[eye] )
+			Mem_Free( vr.images[eye] );
+		vr.images[eye] = NULL;
+		vr.num_images[eye] = 0;
+	}
+}
+
+static void VR_LocateViews( void )
+{
+	XrViewLocateInfo info = { XR_TYPE_VIEW_LOCATE_INFO };
+	XrViewState state = { XR_TYPE_VIEW_STATE };
+	uint32_t count = 0;
+
+	vr.views[0].type = vr.views[1].type = XR_TYPE_VIEW;
+	vr.views[0].next = vr.views[1].next = NULL;
+
+	info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	info.displayTime = vr.display_time;
+	info.space = vr.space;
+
+	vr.views_valid = XR_SUCCEEDED( pxrLocateViews( vr.session, &info, &state, 2, &count, vr.views ))
+		&& count == 2
+		&& FBitSet( state.viewStateFlags, XR_VIEW_STATE_POSITION_VALID_BIT )
+		&& FBitSet( state.viewStateFlags, XR_VIEW_STATE_ORIENTATION_VALID_BIT );
+}
+
+/*
+VR_CopyDesktopToEyes
+
+Called right before the desktop window swaps. For now each eye gets the
+finished desktop frame, center-cropped to the eye's aspect ratio, so the
+whole swapchain -> projection layer -> pacing path works before the
+renderer learns to draw each eye itself.
+*/
+void VR_CopyDesktopToEyes( void )
+{
+	vr_GLint old_draw = 0, old_read = 0;
+	qboolean scissor, srgb;
+	int src_w, src_h, src_x, eye;
+
+	if( !vr.frame_begun || !vr.should_render || !vr.views_valid || !vr.fbo )
+		return;
+
+	if( refState.width <= 0 || refState.height <= 0 )
+		return;
+
+	// largest window rect with the eye's aspect, centered
+	src_h = refState.height;
+	src_w = (int)((double)src_h * vr.eye_width / vr.eye_height );
+	if( src_w > refState.width )
+	{
+		src_w = refState.width;
+		src_h = (int)((double)src_w * vr.eye_height / vr.eye_width );
+	}
+	src_x = ( refState.width - src_w ) / 2;
+
+	vrgl.GetIntegerv( VR_GL_DRAW_FRAMEBUFFER_BINDING, &old_draw );
+	vrgl.GetIntegerv( VR_GL_READ_FRAMEBUFFER_BINDING, &old_read );
+	scissor = vrgl.IsEnabled( VR_GL_SCISSOR_TEST );
+	srgb = vrgl.IsEnabled( VR_GL_FRAMEBUFFER_SRGB );
+	if( scissor ) vrgl.Disable( VR_GL_SCISSOR_TEST ); // blits obey the scissor
+	if( srgb ) vrgl.Disable( VR_GL_FRAMEBUFFER_SRGB ); // copy bytes as they are
+
+	vrgl.BindFramebuffer( VR_GL_READ_FRAMEBUFFER, 0 ); // the window's back buffer
+
+	for( eye = 0; eye < 2; eye++ )
+	{
+		XrSwapchainImageAcquireInfo acquire = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+		XrSwapchainImageWaitInfo wait = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+		XrSwapchainImageReleaseInfo release = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+		uint32_t index;
+
+		if( XR_FAILED( pxrAcquireSwapchainImage( vr.swapchain[eye], &acquire, &index )))
+			break;
+
+		wait.timeout = XR_INFINITE_DURATION;
+		if( XR_FAILED( pxrWaitSwapchainImage( vr.swapchain[eye], &wait )))
+			break; // nothing to release, the wait didn't give us the image
+
+		vrgl.BindFramebuffer( VR_GL_DRAW_FRAMEBUFFER, vr.fbo );
+		vrgl.FramebufferTexture2D( VR_GL_DRAW_FRAMEBUFFER, VR_GL_COLOR_ATTACHMENT0, VR_GL_TEXTURE_2D, vr.images[eye][index].image, 0 );
+
+		if( vrgl.CheckFramebufferStatus( VR_GL_DRAW_FRAMEBUFFER ) == VR_GL_FRAMEBUFFER_COMPLETE )
+		{
+			vrgl.BlitFramebuffer( src_x, 0, src_x + src_w, src_h,
+				0, 0, vr.eye_width, vr.eye_height, VR_GL_COLOR_BUFFER_BIT, VR_GL_LINEAR );
+		}
+
+		vrgl.FramebufferTexture2D( VR_GL_DRAW_FRAMEBUFFER, VR_GL_COLOR_ATTACHMENT0, VR_GL_TEXTURE_2D, 0, 0 );
+		pxrReleaseSwapchainImage( vr.swapchain[eye], &release );
+
+		if( eye == 1 )
+			vr.eyes_written = true;
+	}
+
+	vrgl.BindFramebuffer( VR_GL_DRAW_FRAMEBUFFER, old_draw );
+	vrgl.BindFramebuffer( VR_GL_READ_FRAMEBUFFER, old_read );
+	if( scissor ) vrgl.Enable( VR_GL_SCISSOR_TEST );
+	if( srgb ) vrgl.Enable( VR_GL_FRAMEBUFFER_SRGB );
+}
+
 static void VR_PrintFrameStats( void )
 {
 	double elapsed = Platform_DoubleTime() - vr.begin_time;
@@ -492,6 +784,8 @@ static void VR_DestroySession( void )
 		VR_UpdatePacing( );
 	}
 
+	VR_DestroySwapchains( );
+
 	if( vr.space != XR_NULL_HANDLE )
 		pxrDestroySpace( vr.space );
 
@@ -564,17 +858,46 @@ void VR_PollEvents( void )
 static void VR_SubmitFrame( void )
 {
 	XrFrameEndInfo info = { XR_TYPE_FRAME_END_INFO };
+	XrCompositionLayerProjection layer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+	XrCompositionLayerProjectionView views[2];
+	const XrCompositionLayerBaseHeader *layers[1];
 	XrResult result;
+	int eye;
 
 	if( !vr.frame_begun )
 		return;
 
-	// no layers until the eye swapchains exist, the runtime shows its own
-	// placeholder but still counts the frame as delivered on time
 	info.displayTime = vr.display_time;
 	info.environmentBlendMode = vr.blend_mode;
 	info.layerCount = 0;
 	info.layers = NULL;
+
+	// a frame where the eyes weren't filled (loading, shouldRender false)
+	// goes out with no layers; the runtime keeps showing its last image
+	if( vr.eyes_written )
+	{
+		for( eye = 0; eye < 2; eye++ )
+		{
+			memset( &views[eye], 0, sizeof( views[eye] ));
+			views[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+			views[eye].pose = vr.views[eye].pose;
+			views[eye].fov = vr.views[eye].fov;
+			views[eye].subImage.swapchain = vr.swapchain[eye];
+			views[eye].subImage.imageRect.extent.width = vr.eye_width;
+			views[eye].subImage.imageRect.extent.height = vr.eye_height;
+		}
+
+		layer.space = vr.space;
+		layer.viewCount = 2;
+		layer.views = views;
+		layers[0] = (const XrCompositionLayerBaseHeader *)&layer;
+
+		info.layerCount = 1;
+		info.layers = layers;
+		vr.submits_layers = true; // from now on the headset paces frames
+	}
+
+	vr.eyes_written = false;
 
 	result = pxrEndFrame( vr.session, &info );
 	vr.frame_begun = false;
@@ -629,6 +952,8 @@ void VR_WaitFrame( void )
 	}
 
 	vr.frame_begun = true;
+	vr.eyes_written = false;
+	VR_LocateViews( );
 }
 
 void VR_EndFrame( void )
@@ -675,7 +1000,7 @@ void VR_Init( void )
 		return;
 	}
 
-	if( !VR_CreateInstance( ) || !VR_GetSystem( ) || !VR_CreateSession( ) || !VR_CreateSpace( ))
+	if( !VR_CreateInstance( ) || !VR_GetSystem( ) || !VR_CreateSession( ) || !VR_CreateSpace( ) || !VR_CreateSwapchains( ))
 	{
 		VR_Shutdown( );
 		return;

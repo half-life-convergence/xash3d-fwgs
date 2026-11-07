@@ -20,6 +20,17 @@ GNU General Public License for more details.
 #include "platform/platform.h"
 #include "vid_common.h"
 #include "imagelib.h"
+#if XASH_OPENXR
+#include "vr/vr.h"
+
+// the finished frame is still in the back buffer here, hand it to the
+// headset before the desktop window swaps
+static void GL_SwapBuffers_VR( void )
+{
+	VR_CopyDesktopToEyes();
+	GL_SwapBuffers();
+}
+#endif
 
 struct ref_state_s ref;
 
@@ -412,7 +423,11 @@ static const ref_api_t gEngfuncs =
 	GL_SetAttribute,
 	GL_GetAttribute,
 	GL_GetProcAddress,
+#if XASH_OPENXR
+	GL_SwapBuffers_VR,
+#else
 	GL_SwapBuffers,
+#endif
 
 	SW_CreateBuffer,
 	SW_LockBuffer,
