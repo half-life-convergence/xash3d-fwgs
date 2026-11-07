@@ -56,6 +56,12 @@ struct usercmd_s;
 void VR_RoomRequest( struct usercmd_s *cmd );
 void VR_RoomApplied( const float *moved );
 
+// controllers (vr_input.c), around the client's CL_CreateMove in CL_CreateCmd:
+// VR_PreCreateMove syncs the actions and turns the view, VR_CreateMove adds
+// buttons and stick movement to the command
+void VR_PreCreateMove( float frametime );
+void VR_CreateMove( struct usercmd_s *cmd );
+
 // the engine's usercmd_t keeps Half-Life's impact_position[3] floats as
 // raw 32-bit slots reserved[1..3]; the game DLLs see the same memory as floats
 #define VR_CMD_ROOMMOVE( cmd ) ((float *)&( cmd )->reserved[1] )

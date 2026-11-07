@@ -808,11 +808,18 @@ static void CL_CreateCmd( void )
 
 	qboolean  active = (( cls.signon == SIGNONS ) && !cl.paused && !cls.demoplayback );
 	Platform_PreCreateMove();
+#if XASH_OPENXR
+	if( active )
+		VR_PreCreateMove( host.frametime ); // controllers: sync, turn the view
+#endif
 	clgame.dllFuncs.CL_CreateMove( host.frametime, cmd, active );
 	IN_EngineAppendMove( host.frametime, cmd, active );
 #if XASH_OPENXR
 	if( active )
+	{
+		VR_CreateMove( cmd ); // controller buttons and stick movement
 		VR_RoomRequest( cmd ); // walk the player toward the real head
+	}
 #endif
 
 	CL_PopPMStates();

@@ -18,7 +18,7 @@ GNU General Public License for more details.
 
 #if XASH_OPENXR
 
-#include "vr.h"
+#include "vr_local.h"
 #include "platform/platform.h"
 #include "ref_common.h" // refState, the window size
 #include "const.h" // kRenderTransTexture
@@ -26,19 +26,6 @@ GNU General Public License for more details.
 #if XASH_SDL == 2
 #include <SDL.h> // SDL_GL_SetSwapInterval for the desktop mirror window
 #endif
-
-// the loader is opened in runtime, so only xrGetInstanceProcAddr is linked
-// by name and everything else is fetched through it
-#define XR_NO_PROTOTYPES 1
-#if XASH_WIN32
-#include <windows.h>
-#include <unknwn.h> // IUnknown, used by openxr_platform.h on win32
-#define XR_USE_PLATFORM_WIN32 1
-#endif
-#define XR_USE_GRAPHICS_API_OPENGL 1
-#include <openxr/openxr.h>
-#include <openxr/openxr_platform.h>
-#include <openxr/openxr_reflection.h>
 
 #define VR_OPENGL_EXTENSION "XR_KHR_opengl_enable"
 
@@ -193,6 +180,7 @@ static struct
 	vec3_t   head_prev; // last head center, game units, play space axes
 	qboolean head_prev_valid;
 	float    fade; // head-in-wall fade, 0..1
+	float    head_yaw; // degrees, where the head faces in the play space, for head-relative stick movement
 
 	uint32_t frames; // frames submitted since the session began
 	uint32_t frames_rendered; // ... of which the renderer drew the eyes
@@ -229,7 +217,7 @@ static const char *VR_SessionStateString( XrSessionState state )
 }
 
 // works without an instance, unlike xrResultToString
-static const char *VR_ResultString( XrResult result )
+const char *VR_ResultString( XrResult result )
 {
 	static char buf[64];
 
@@ -245,7 +233,7 @@ static const char *VR_ResultString( XrResult result )
 	return buf;
 }
 
-static qboolean VR_GetProc( XrInstance instance, const char *name, PFN_xrVoidFunction *func )
+qboolean VR_LoadProc( XrInstance instance, const char *name, PFN_xrVoidFunction *func )
 {
 	XrResult result = pxrGetInstanceProcAddr( instance, name, func );
 
@@ -258,7 +246,7 @@ static qboolean VR_GetProc( XrInstance instance, const char *name, PFN_xrVoidFun
 	return true;
 }
 
-#define VR_GET_PROC( instance, name ) VR_GetProc(( instance ), #name, (PFN_xrVoidFunction *)&p##name )
+#define VR_GET_PROC( instance, name ) VR_LoadProc(( instance ), #name, (PFN_xrVoidFunction *)&p##name )
 
 static qboolean VR_HasExtension( const char *name )
 {
@@ -1159,6 +1147,17 @@ int VR_RenderEyes( const ref_viewpass_t *rvp )
 	VR_UpdateRoom( rvp->viewangles[YAW] );
 	VR_HeadCenter( head );
 	{
+		// where the head faces in the play space, the sticks move relative to it
+		static const XrVector3f xr_forward = { 0.0f, 0.0f, -1.0f };
+		XrVector3f axis;
+		vec3_t fwd;
+
+		VR_RotateVector( &vr.views[0].pose.orientation, &xr_forward, &axis );
+		VR_VectorToGame( &axis, fwd );
+		if( fwd[0] != 0.0f || fwd[1] != 0.0f )
+			vr.head_yaw = RAD2DEG( atan2f( fwd[1], fwd[0] ));
+	}
+	{
 		// the head's place in the world, for the wall check
 		float yaw = DEG2RAD( rvp->viewangles[YAW] );
 		vec3_t feet, turned, local = { 0.0f, 0.0f, head[2] };
@@ -1441,6 +1440,7 @@ static void VR_DestroySession( void )
 	}
 
 	VR_DestroySwapchains( );
+	VR_ShutdownInput( );
 
 	if( vr.space != XR_NULL_HANDLE )
 		pxrDestroySpace( vr.space );
@@ -1501,6 +1501,9 @@ void VR_PollEvents( void )
 		case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
 			Con_Printf( "VR: OpenXR runtime is shutting down, VR disabled\n" );
 			VR_Shutdown( );
+			break;
+		case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
+			VR_InputProfileChanged( );
 			break;
 		case XR_TYPE_EVENT_DATA_EVENTS_LOST:
 			Con_Printf( S_WARN "VR: lost %u OpenXR events\n", ((const XrEventDataEventsLost *)&ev )->lostEventCount );
@@ -1642,9 +1645,29 @@ static void VR_Info_f( void )
 	if( vr.running )
 		VR_PrintFrameStats( );
 
-	Con_Printf( "VR: room scale %s, player at %.1f %.1f %.1f, head %.1f units away, wall fade %.2f\n",
-		vr_roomscale.value ? "on" : "off", cl.simorg[0], cl.simorg[1], cl.simorg[2],
+	Con_Printf( "VR: room scale %s, player at %.1f %.1f %.1f yaw %.0f, head %.1f units away, wall fade %.2f\n",
+		vr_roomscale.value ? "on" : "off", cl.simorg[0], cl.simorg[1], cl.simorg[2], cl.viewangles[YAW],
 		sqrtf( vr.room_gap[0] * vr.room_gap[0] + vr.room_gap[1] * vr.room_gap[1] ), vr.fade );
+}
+
+XrInstance VR_GetInstance( void )
+{
+	return vr.instance;
+}
+
+XrSession VR_GetSession( void )
+{
+	return vr.session;
+}
+
+qboolean VR_SessionFocused( void )
+{
+	return vr.running && vr.session_state == XR_SESSION_STATE_FOCUSED;
+}
+
+float VR_HeadYaw( void )
+{
+	return vr.head_yaw;
 }
 
 qboolean VR_Active( void )
@@ -1673,7 +1696,7 @@ void VR_Init( void )
 		return;
 	}
 
-	if( !VR_CreateInstance( ) || !VR_GetSystem( ) || !VR_CreateSession( ) || !VR_CreateSpace( ) || !VR_CreateSwapchains( ))
+	if( !VR_CreateInstance( ) || !VR_GetSystem( ) || !VR_CreateSession( ) || !VR_CreateSpace( ) || !VR_CreateSwapchains( ) || !VR_InitInput( ))
 	{
 		VR_Shutdown( );
 		return;
