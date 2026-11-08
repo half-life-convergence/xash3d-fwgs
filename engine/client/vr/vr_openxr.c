@@ -184,6 +184,9 @@ static struct
 	qboolean head_prev_valid;
 	float    fade; // head-in-wall fade, 0..1
 	float    head_yaw; // degrees, where the head faces in the play space, for head-relative stick movement
+	float    feet_z; // the box bottom with stairs smoothed, see VR_UpdateStairs
+	qboolean feet_valid;
+	float    stair_lag_max; // largest smoothing so far, for vr_info
 
 	// hands in the world, this frame: grip position, aim direction.
 	// hand_origin is where the hand is drawn, kept out of walls; the
@@ -240,10 +243,16 @@ static CVAR_DEFINE_AUTO( vr_msaa, "4", FCVAR_ARCHIVE, "multisample anti-aliasing
 static CVAR_DEFINE_AUTO( vr_handweapon, "1", FCVAR_ARCHIVE, "the weapon follows the right hand instead of the camera" );
 static CVAR_DEFINE_AUTO( vr_viewmodel_grip, "12 6 -9", FCVAR_ARCHIVE, "where the hand holds the weapon model, \"forward right up\" in model units from its origin" );
 static CVAR_DEFINE_AUTO( vr_debug_headmove, "0 0", 0, "developer: move the tracked head by \"forward left\" metres in the play space, to test room scale without a headset" );
+static CVAR_DEFINE_AUTO( vr_stairsmooth, "1", FCVAR_ARCHIVE, "smooth the view up and down stairs and steps instead of popping" );
 static CVAR_DEFINE_AUTO( vr_handcollide, "1", FCVAR_ARCHIVE, "hands and the weapon stop at walls instead of going through them" );
 static CVAR_DEFINE_AUTO( vr_weapon_length, "12", FCVAR_ARCHIVE, "for weapon models without a muzzle point that aren't in the built-in table: how far they reach past the hand along the aim, game units" );
 static CVAR_DEFINE_AUTO( vr_loadfade, "0.5", FCVAR_ARCHIVE, "seconds the view takes to fade in after loading, 0 = no fade" );
 static CVAR_DEFINE_AUTO( vr_debug_unfocused, "0", 0, "developer: act as if the headset lost focus (headset off, system menu open), to test pausing without a headset" );
+
+// stair smoothing, see VR_UpdateStairs
+#define VR_STAIR_RATE 12.0f // how fast the view catches up, 1/s (~13 units behind running up stairs at 4 m/s)
+#define VR_STEP_MAX 18.0f // never more than a step behind (player movement's step height)
+#define VR_STEP_SNAP 24.0f // a bigger jump in height is a teleport or respawn, follow it at once
 
 // hand collision, see VR_CollideHand
 #define VR_HAND_RADIUS 1.5f // game units (~4 cm) kept between a hand and a surface
@@ -998,11 +1007,45 @@ static void VR_HeadCenter( vec3_t out )
 	VectorAverage( l, r, out );
 }
 
-// bottom of the player's collision box, where the STAGE floor is
+// bottom of the player's collision box
+static float VR_BoxBottom( void )
+{
+	return cl.simorg[2] + (( cl.local.usehull == 1 ) ? -18.0f : -36.0f ); // ducked or standing hull bottom
+}
+
+/*
+VR_UpdateStairs
+
+Once per rendered frame. Player movement lifts the body up each stair
+(up to 18 units) in a single frame; the flat game hides that with view
+smoothing in V_CalcRefdef, but in VR the whole world would pop under the
+real head. So the height the eyes and hands are placed from follows the
+box bottom smoothly while walking on the ground, never more than one
+step behind. Jumps, falls, swimming and big jumps in height (teleports,
+respawns) are followed exactly.
+*/
+static void VR_UpdateStairs( void )
+{
+	float raw = VR_BoxBottom( ), diff = raw - vr.feet_z;
+
+	if( !vr_stairsmooth.value || cls.state != ca_active || !vr.feet_valid
+		|| cl.local.onground == -1 || cl.local.waterlevel >= 2 || fabsf( diff ) > VR_STEP_SNAP )
+	{
+		vr.feet_z = raw;
+		vr.feet_valid = cls.state == ca_active;
+		return;
+	}
+
+	vr.feet_z += diff * ( 1.0f - expf( -(float)host.realframetime * VR_STAIR_RATE ));
+	vr.feet_z = bound( raw - VR_STEP_MAX, vr.feet_z, raw + VR_STEP_MAX );
+	vr.stair_lag_max = Q_max( vr.stair_lag_max, fabsf( raw - vr.feet_z ));
+}
+
+// where the STAGE floor is: the bottom of the collision box, with steps smoothed
 static void VR_PlayerFeet( vec3_t out )
 {
 	VectorCopy( cl.simorg, out );
-	out[2] += ( cl.local.usehull == 1 ) ? -18.0f : -36.0f; // ducked or standing hull bottom
+	out[2] = vr.feet_valid ? vr.feet_z : VR_BoxBottom( );
 }
 
 static void VR_ResetRoom( void )
@@ -1784,6 +1827,7 @@ int VR_RenderEyes( const ref_viewpass_t *rvp )
 		return VR_EYES_NONE;
 
 	VR_UpdateRoom( rvp->viewangles[YAW] );
+	VR_UpdateStairs( );
 	VR_HeadCenter( head );
 	{
 		// where the head faces in the play space, the sticks move relative to it
@@ -2630,6 +2674,8 @@ static void VR_Info_f( void )
 	Con_Printf( "VR: room scale %s, player at %.1f %.1f %.1f yaw %.0f, head %.1f units away, wall fade %.2f\n",
 		vr_roomscale.value ? "on" : "off", cl.simorg[0], cl.simorg[1], cl.simorg[2], cl.viewangles[YAW],
 		sqrtf( vr.room_gap[0] * vr.room_gap[0] + vr.room_gap[1] * vr.room_gap[1] ), vr.fade );
+	Con_Printf( "VR: view floor %.1f, box bottom %.1f (stairs smoothed by up to %.1f units so far)\n",
+		vr.feet_valid ? vr.feet_z : VR_BoxBottom( ), VR_BoxBottom( ), vr.stair_lag_max );
 	Con_Printf( "VR: moving at %.0f units/s (%.1f m/s) horizontally\n", sqrtf( cl.simvel[0] * cl.simvel[0] + cl.simvel[1] * cl.simvel[1] ),
 		sqrtf( cl.simvel[0] * cl.simvel[0] + cl.simvel[1] * cl.simvel[1] ) / Q_max( 1.0f, vr_worldscale.value ));
 
@@ -2724,6 +2770,7 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_handweapon );
 	Cvar_RegisterVariable( &vr_viewmodel_grip );
 	Cvar_RegisterVariable( &vr_debug_headmove );
+	Cvar_RegisterVariable( &vr_stairsmooth );
 	Cvar_RegisterVariable( &vr_handcollide );
 	Cvar_RegisterVariable( &vr_weapon_length );
 	Cvar_RegisterVariable( &vr_loadfade );
