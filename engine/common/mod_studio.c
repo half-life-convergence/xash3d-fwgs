@@ -20,6 +20,7 @@ GNU General Public License for more details.
 #include "library.h"
 #include "ref_common.h"
 #include "swaplib.h"
+#include "vr/vr.h"
 
 typedef int (*STUDIOAPI)( int, sv_blending_interface_t**, server_studio_api_t*,  float (*transform)[3][4], float (*bones)[MAXSTUDIOBONES][3][4] );
 
@@ -1243,6 +1244,11 @@ void Mod_LoadStudioModel( model_t *mod, void *buffer, size_t buffersize, qboolea
 	mod->numframes = Mod_StudioBodyVariations( mod );
 	mod->radius = RadiusFromBounds( mod->mins, mod->maxs );
 	mod->flags = phdr->flags; // copy header flags
+
+#if XASH_OPENXR && !XASH_DEDICATED
+	if( !Host_IsDedicated( ))
+		VR_MarkViewmodelArms( mod->name, phdr ); // after the copy, it only sets studio flags
+#endif
 
 	if( loaded ) *loaded = true;
 }

@@ -1941,6 +1941,33 @@ static void R_StudioSubmitMesh( short *ptricmds, vec3_t *pstudionorms, float s, 
 
 /*
 ===============
+R_StudioSubmodelIsArms
+
+true when every mesh of the current submodel is part of the player's
+arms (STUDIO_NF_VR_ARM, set by the engine's VR layer at load)
+===============
+*/
+static qboolean R_StudioSubmodelIsArms( void )
+{
+	mstudiotexture_t *ptexture = (mstudiotexture_t *)((byte *)m_pStudioHeader + m_pStudioHeader->textureindex);
+	mstudiomesh_t *pmesh = (mstudiomesh_t *)((byte *)m_pStudioHeader + m_pSubModel->meshindex);
+	short *pskinref = (short *)((byte *)m_pStudioHeader + m_pStudioHeader->skinindex);
+
+	if( m_pSubModel->nummesh <= 0 )
+		return false;
+
+	// skin family 0 decides, like the engine's marking
+	for( int j = 0; j < m_pSubModel->nummesh; j++ )
+	{
+		if( !FBitSet( ptexture[pskinref[pmesh[j].skinref]].flags, STUDIO_NF_VR_ARM ))
+			return false;
+	}
+
+	return true;
+}
+
+/*
+===============
 R_StudioDrawPoints
 
 ===============
@@ -1952,6 +1979,13 @@ static void R_StudioDrawPoints( void )
 
 	if( !m_pStudioHeader ) return;
 
+	// VR: the weapon sits in the tracked hand, leave out the arms built into it
+	// (marked at load by the engine, see engine/client/vr/vr_arms.c)
+	qboolean hide_arms = FBitSet( RI.rvp.flags, RF_VIEWMODEL_NOARMS ) && RI.currententity == tr.viewent;
+	if( hide_arms && R_StudioSubmodelIsArms( ))
+		return;
+	if( FBitSet( m_pStudioHeader->flags, STUDIO_VR_ARMS_SUBMODEL ))
+		hide_arms = false; // what's left using arm textures is part of the weapon
 
 	g_studio.numverts = g_studio.numelems = 0;
 
@@ -2083,6 +2117,9 @@ static void R_StudioDrawPoints( void )
 		short *ptricmds = (short *)((byte *)m_pStudioHeader + pmesh->triindex);
 
 		g_nFaceFlags = ptexture[pskinref[pmesh->skinref]].flags | g_nForceFaceFlags;
+
+		if( hide_arms && FBitSet( g_nFaceFlags, STUDIO_NF_VR_ARM ))
+			continue;
 
 		float s = 1.0f / (float)ptexture[pskinref[pmesh->skinref]].width;
 		float t = 1.0f / (float)ptexture[pskinref[pmesh->skinref]].height;

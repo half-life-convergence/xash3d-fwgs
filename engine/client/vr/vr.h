@@ -80,6 +80,15 @@ void VR_CopyDesktopToEyes( void );
 // asleep, system menu open), which pauses singleplayer like the menu does
 qboolean VR_PausesGame( void );
 
+// called by Mod_LoadStudioModel for every studio model (vr_arms.c): marks the
+// arms built into weapon models (STUDIO_NF_VR_ARM, STUDIO_VR_ARMS_SUBMODEL)
+// so eye passes can leave them out (RF_VIEWMODEL_NOARMS)
+struct studiohdr_s;
+void VR_MarkViewmodelArms( const char *modelname, struct studiohdr_s *phdr );
+
+// extra ref_viewpass_t flags for the desktop pass of a frame whose eyes were drawn
+int VR_DesktopPassFlags( void );
+
 #endif // XASH_OPENXR
 
 #endif // VR_H

@@ -446,7 +446,7 @@ void V_RenderView( void )
 			else
 			{
 				if( eyes == VR_EYES_RENDERED )
-					SetBits( rvp.flags, RF_REPEAT_PASS );
+					SetBits( rvp.flags, VR_DesktopPassFlags( ));
 				GL_RenderFrame( &rvp );
 			}
 		}

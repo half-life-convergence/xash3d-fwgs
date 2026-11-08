@@ -64,6 +64,7 @@ Studio models are position independent, so the cache manager can move them.
 
 #define STUDIO_HAS_BUMP			(1U<<16)	// loadtime set
 #define STUDIO_STATIC_PROP		(1U<<29)	// hint for engine
+#define STUDIO_VR_ARMS_SUBMODEL	(1U<<29)	// loadtime set (VR): the arms have submodels of their own, STUDIO_NF_VR_ARM meshes elsewhere are weapon parts
 #define STUDIO_HAS_BONEINFO		(1U<<30)	// extra info about bones (pose matrix, procedural index etc)
 #define STUDIO_HAS_BONEWEIGHTS	(1U<<31)	// yes we got support of bone weighting
 
@@ -90,6 +91,7 @@ Studio models are position independent, so the cache manager can move them.
 
 #define STUDIO_NF_HAS_ALPHA		(1U<<20)	// external texture has alpha-channel
 #define STUDIO_NF_HAS_DETAIL		(1U<<21)	// studiomodels has detail textures
+#define STUDIO_NF_VR_ARM		(1U<<29)	// loadtime set (VR): part of the player's arms built into a weapon model
 #define STUDIO_NF_COLORMAP		(1U<<30)	// internal system flag
 #define STUDIO_NF_UV_COORDS		(1U<<31)	// using half-float coords instead of ST
 

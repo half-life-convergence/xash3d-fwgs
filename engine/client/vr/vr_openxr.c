@@ -249,6 +249,8 @@ static CVAR_DEFINE_AUTO( vr_viewmodel_grip, "12 6 -9", FCVAR_ARCHIVE, "where the
 static CVAR_DEFINE_AUTO( vr_debug_headmove, "0 0", 0, "developer: move the tracked head by \"forward left\" metres in the play space, to test room scale without a headset" );
 static CVAR_DEFINE_AUTO( vr_crouchheight, "1.2", FCVAR_ARCHIVE, "the player ducks when the real head is lower than this many metres (after vr_heightoffset); 0 = no physical crouching" );
 static CVAR_DEFINE_AUTO( vr_stairsmooth, "1", FCVAR_ARCHIVE, "smooth the view up and down stairs and steps instead of popping" );
+static CVAR_DEFINE_AUTO( vr_hidearms, "1", FCVAR_ARCHIVE, "leave out the arms built into Half-Life's weapon models while the weapon is in the hand" );
+static int VR_ViewmodelFlags( void );
 static CVAR_DEFINE_AUTO( vr_handcollide, "1", FCVAR_ARCHIVE, "hands and the weapon stop at walls instead of going through them" );
 static CVAR_DEFINE_AUTO( vr_weapon_length, "12", FCVAR_ARCHIVE, "for weapon models without a muzzle point that aren't in the built-in table: how far they reach past the hand along the aim, game units" );
 static CVAR_DEFINE_AUTO( vr_loadfade, "0.5", FCVAR_ARCHIVE, "seconds the view takes to fade in after loading, 0 = no fade" );
@@ -2032,6 +2034,7 @@ int VR_RenderEyes( const ref_viewpass_t *rvp )
 			SetBits( eye_rvp.flags, RF_EXTERNAL_TARGET|RF_ASYMMETRIC_FOV );
 			if( vr_handweapon.value && vr.hand_valid[VR_HAND_RIGHT] && vr_handcollide.value )
 				SetBits( eye_rvp.flags, RF_WORLD_VIEWMODEL ); // the gun is in the hand and kept out of walls
+			SetBits( eye_rvp.flags, VR_ViewmodelFlags( ));
 			if( stepped )
 				SetBits( eye_rvp.flags, RF_REPEAT_PASS );
 
@@ -2107,6 +2110,23 @@ static qboolean VR_GameLoading( void )
 	if( cls.state > ca_disconnected && cls.state < ca_active )
 		return true; // connecting to the new map, precaching
 	return false;
+}
+
+/*
+VR_ViewmodelFlags
+
+The weapon is in the tracked hand: its built-in arms would float behind it.
+*/
+static int VR_ViewmodelFlags( void )
+{
+	if( vr_hidearms.value && vr_handweapon.value && vr.hand_valid[VR_HAND_RIGHT] )
+		return RF_VIEWMODEL_NOARMS;
+	return 0;
+}
+
+int VR_DesktopPassFlags( void )
+{
+	return RF_REPEAT_PASS | VR_ViewmodelFlags( );
 }
 
 /*
@@ -2874,6 +2894,7 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_crouchheight );
 	Cvar_RegisterVariable( &vr_stairsmooth );
 	Cvar_RegisterVariable( &vr_handcollide );
+	Cvar_RegisterVariable( &vr_hidearms );
 	Cvar_RegisterVariable( &vr_weapon_length );
 	Cvar_RegisterVariable( &vr_loadfade );
 	Cvar_RegisterVariable( &vr_debug_unfocused );

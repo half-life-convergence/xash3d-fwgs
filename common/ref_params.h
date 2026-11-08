@@ -96,6 +96,7 @@ typedef struct ref_overview_s
 #define RF_ASYMMETRIC_FOV	(1<<5)		// projection and culling use fov_tan instead of fov_x/fov_y (VR eye)
 #define RF_REPEAT_PASS	(1<<6)		// another view of a frame that was already drawn once: no time step, no viewmodel events
 #define RF_WORLD_VIEWMODEL	(1<<7)		// the viewmodel is placed in the world (VR hand): normal depth range, no squeezing in front of walls
+#define RF_VIEWMODEL_NOARMS	(1<<8)		// leave out the viewmodel meshes marked STUDIO_NF_VR_ARM (VR hand holds the weapon)
 
 // intermediate struct for viewpass (or just a single frame)
 typedef struct ref_viewpass_s
