@@ -40,6 +40,7 @@ static CVAR_DEFINE_AUTO( vr_turnmode, "0", FCVAR_ARCHIVE, "right stick turning: 
 static CVAR_DEFINE_AUTO( vr_snapturn, "45", FCVAR_ARCHIVE, "degrees per snap turn" );
 static CVAR_DEFINE_AUTO( vr_turnspeed, "120", FCVAR_ARCHIVE, "smooth turning speed, degrees per second" );
 static CVAR_DEFINE_AUTO( vr_movespeed, "4", FCVAR_ARCHIVE, "stick movement speed at full tilt in metres per second (the original game runs at ~8); 0 = the original full speed" );
+static CVAR_DEFINE_AUTO( vr_autocrouch, "1", FCVAR_ARCHIVE, "jumping ducks the player until landing, like a crouch jump, so ledges and vents need only the jump button" );
 static CVAR_DEFINE_AUTO( vr_crouchtoggle, "1", FCVAR_ARCHIVE, "the crouch button: 1 = press to toggle ducking, 0 = hold to duck" );
 static CVAR_DEFINE_AUTO( vr_movedir, "0", FCVAR_ARCHIVE, "the move stick goes where: 0 = the head looks, 1 = the left hand points" );
 static CVAR_DEFINE_AUTO( vr_debug_sticks, "0 0 0 0", 0, "developer: pretend the sticks are at \"left_x left_y right_x right_y\", to test without controllers" );
@@ -180,6 +181,9 @@ static struct
 	qboolean     crouch_was_down;
 	qboolean     crouch_latched; // vr_crouchtoggle: ducked by the button
 	qboolean     crouch_debug_press; // vr_debug_crouchpress
+	qboolean     jump_ducking; // vr_autocrouch: a jump is under way
+	qboolean     jump_left_ground; // ... and the player has left the ground
+	double       jump_time;
 } vri;
 
 static void VR_DebugCrouchPress_f( void )
@@ -263,6 +267,7 @@ qboolean VR_InitInput( void )
 	Cvar_RegisterVariable( &vr_movespeed );
 	Cvar_RegisterVariable( &vr_movedir );
 	Cvar_RegisterVariable( &vr_crouchtoggle );
+	Cvar_RegisterVariable( &vr_autocrouch );
 	Cmd_AddCommand( "vr_debug_crouchpress", VR_DebugCrouchPress_f, "developer: press the crouch button once, to test without controllers" );
 	Cvar_RegisterVariable( &vr_debug_sticks );
 	Cvar_RegisterVariable( &vr_debug_hands );
@@ -619,10 +624,16 @@ crawls don't need a button held down. Crouching for real (VR_PhysicalCrouch)
 ducks too; either one keeps the player ducked. Player movement only
 stands up when there's room, so letting go in a vent stays ducked until
 the player is out.
+
+With vr_autocrouch, a jump (from the controller or the keyboard) ducks
+from the moment the player leaves the ground until he lands, like a
+crouch jump. Ducking in the air is instant in player movement, and the
+view doesn't move when the legs tuck up (see VR_UpdateStairs).
 */
-static int VR_CrouchButtons( void )
+static int VR_CrouchButtons( int cmdbuttons )
 {
 	int buttons = vri.buttons;
+	qboolean onground = cl.local.onground != -1;
 	qboolean down = FBitSet( buttons, IN_DUCK ) || vri.crouch_debug_press;
 
 	vri.crouch_debug_press = false;
@@ -648,6 +659,28 @@ static int VR_CrouchButtons( void )
 	if( VR_PhysicalCrouch( ))
 		SetBits( buttons, IN_DUCK );
 
+	if( vr_autocrouch.value && cls.state == ca_active )
+	{
+		if( FBitSet( buttons | cmdbuttons, IN_JUMP ) && onground && !vri.jump_ducking )
+		{
+			vri.jump_ducking = true;
+			vri.jump_left_ground = false;
+			vri.jump_time = host.realtime;
+		}
+
+		if( vri.jump_ducking )
+		{
+			if( !onground )
+				vri.jump_left_ground = true;
+			else if( vri.jump_left_ground || host.realtime - vri.jump_time > 0.3 )
+				vri.jump_ducking = false; // landed, or the jump never happened (a ceiling)
+		}
+
+		if( vri.jump_ducking && vri.jump_left_ground )
+			SetBits( buttons, IN_DUCK );
+	}
+	else vri.jump_ducking = false;
+
 	return buttons;
 }
 
@@ -658,7 +691,7 @@ void VR_CreateMove( usercmd_t *cmd )
 	if( !vri.initialized || !VR_Active( ))
 		return;
 
-	cmd->buttons |= VR_CrouchButtons( );
+	cmd->buttons |= VR_CrouchButtons( cmd->buttons );
 
 	mx = VR_Deadzone( vri.move.x );
 	my = VR_Deadzone( vri.move.y );

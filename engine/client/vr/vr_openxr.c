@@ -185,6 +185,8 @@ static struct
 	float    fade; // head-in-wall fade, 0..1
 	float    head_yaw; // degrees, where the head faces in the play space, for head-relative stick movement
 	float    feet_z; // the box bottom with stairs smoothed, see VR_UpdateStairs
+	float    air_tuck; // ducking in the air lifted the box bottom by this, the view stays put
+	int      prev_hull; // last frame's cl.local.usehull, -1 = none
 	qboolean feet_valid;
 	float    stair_lag_max; // largest smoothing so far, for vr_info
 	float    head_height; // the head center above the play space floor, game units (vr_heightoffset included)
@@ -256,6 +258,7 @@ static CVAR_DEFINE_AUTO( vr_debug_unfocused, "0", 0, "developer: act as if the h
 #define VR_STAIR_RATE 12.0f // how fast the view catches up, 1/s (~13 units behind running up stairs at 4 m/s)
 #define VR_STEP_MAX 18.0f // never more than a step behind (player movement's step height)
 #define VR_STEP_SNAP 24.0f // a bigger jump in height is a teleport or respawn, follow it at once
+#define VR_TUCK_RATE 4.0f // how fast the view lets go of a mid-air duck, 1/s (about half of it in a normal jump)
 
 // ducking, see VR_UpdateDuckView
 #define VR_DUCK_EYE 30.0f // the game's ducked eye height above the feet: duck hull bottom 18 + view offset 12
@@ -1031,10 +1034,35 @@ real head. So the height the eyes and hands are placed from follows the
 box bottom smoothly while walking on the ground, never more than one
 step behind. Jumps, falls, swimming and big jumps in height (teleports,
 respawns) are followed exactly.
+
+Ducking in the air keeps the origin and tucks the legs up, which lifts the
+box bottom by 18 units; on the ground ducking lowers the origin instead
+and the bottom stays. So a duck or unduck in the air is carried in
+vr.air_tuck, and the view doesn't jump (auto-crouch ducks on every jump).
+It fades during the flight, and on landing the rest is dropped and the
+stair smoothing takes the view to the floor, so landing with tucked legs
+doesn't dip the view by the whole 18 units.
 */
 static void VR_UpdateStairs( void )
 {
-	float raw = VR_BoxBottom( ), diff = raw - vr.feet_z;
+	float raw, diff;
+	int hull = cl.local.usehull;
+
+	if( cls.state != ca_active || cl.local.onground != -1 )
+		vr.air_tuck = 0.0f;
+	else
+	{
+		if( vr.prev_hull >= 0 && hull != vr.prev_hull )
+			vr.air_tuck += ( hull == 1 ) ? -18.0f : 18.0f; // the bottom moved, the body didn't
+
+		// fade it out during the flight, so a tucked landing doesn't dip the
+		// view 18 units below standing height before the player stands up
+		vr.air_tuck *= expf( -(float)host.realframetime * VR_TUCK_RATE );
+	}
+	vr.prev_hull = ( cls.state == ca_active ) ? hull : -1;
+
+	raw = VR_BoxBottom( ) + vr.air_tuck;
+	diff = raw - vr.feet_z;
 
 	if( !vr_stairsmooth.value || cls.state != ca_active || !vr.feet_valid
 		|| cl.local.onground == -1 || cl.local.waterlevel >= 2 || fabsf( diff ) > VR_STEP_SNAP )
@@ -1065,7 +1093,8 @@ static void VR_UpdateDuckView( float head_height )
 
 	vr.head_height = head_height;
 
-	if( cls.state == ca_active && cl.local.usehull == 1 )
+	// not in the air: auto-crouch ducks every jump, and a jump shouldn't dip the view
+	if( cls.state == ca_active && cl.local.usehull == 1 && cl.local.onground != -1 )
 		target = Q_max( 0.0f, head_height - VR_DUCK_EYE );
 
 	vr.duck_lower += ( target - vr.duck_lower ) * ( 1.0f - expf( -(float)host.realframetime * VR_DUCK_RATE ));
@@ -2745,9 +2774,9 @@ static void VR_Info_f( void )
 		sqrtf( vr.room_gap[0] * vr.room_gap[0] + vr.room_gap[1] * vr.room_gap[1] ), vr.fade );
 	Con_Printf( "VR: view floor %.1f, box bottom %.1f (stairs smoothed by up to %.1f units so far)\n",
 		vr.feet_valid ? vr.feet_z : VR_BoxBottom( ), VR_BoxBottom( ), vr.stair_lag_max );
-	Con_Printf( "VR: head %.2f m above the floor (crouch below %.2f m), %s, view lowered %.1f units\n",
+	Con_Printf( "VR: head %.2f m above the floor (crouch below %.2f m), %s, %s, view lowered %.1f units\n",
 		vr.head_height / Q_max( 1.0f, vr_worldscale.value ), vr_crouchheight.value,
-		cl.local.usehull == 1 ? "ducked" : "standing", vr.duck_lower );
+		cl.local.usehull == 1 ? "ducked" : "standing", cl.local.onground != -1 ? "on the ground" : "in the air", vr.duck_lower );
 	Con_Printf( "VR: moving at %.0f units/s (%.1f m/s) horizontally\n", sqrtf( cl.simvel[0] * cl.simvel[0] + cl.simvel[1] * cl.simvel[1] ),
 		sqrtf( cl.simvel[0] * cl.simvel[0] + cl.simvel[1] * cl.simvel[1] ) / Q_max( 1.0f, vr_worldscale.value ));
 
