@@ -187,6 +187,8 @@ static struct
 	float    feet_z; // the box bottom with stairs smoothed, see VR_UpdateStairs
 	qboolean feet_valid;
 	float    stair_lag_max; // largest smoothing so far, for vr_info
+	float    head_height; // the head center above the play space floor, game units (vr_heightoffset included)
+	float    duck_lower; // the view is lowered this much while ducked, see VR_UpdateDuckView
 
 	// hands in the world, this frame: grip position, aim direction.
 	// hand_origin is where the hand is drawn, kept out of walls; the
@@ -243,6 +245,7 @@ static CVAR_DEFINE_AUTO( vr_msaa, "4", FCVAR_ARCHIVE, "multisample anti-aliasing
 static CVAR_DEFINE_AUTO( vr_handweapon, "1", FCVAR_ARCHIVE, "the weapon follows the right hand instead of the camera" );
 static CVAR_DEFINE_AUTO( vr_viewmodel_grip, "12 6 -9", FCVAR_ARCHIVE, "where the hand holds the weapon model, \"forward right up\" in model units from its origin" );
 static CVAR_DEFINE_AUTO( vr_debug_headmove, "0 0", 0, "developer: move the tracked head by \"forward left\" metres in the play space, to test room scale without a headset" );
+static CVAR_DEFINE_AUTO( vr_crouchheight, "1.2", FCVAR_ARCHIVE, "the player ducks when the real head is lower than this many metres (after vr_heightoffset); 0 = no physical crouching" );
 static CVAR_DEFINE_AUTO( vr_stairsmooth, "1", FCVAR_ARCHIVE, "smooth the view up and down stairs and steps instead of popping" );
 static CVAR_DEFINE_AUTO( vr_handcollide, "1", FCVAR_ARCHIVE, "hands and the weapon stop at walls instead of going through them" );
 static CVAR_DEFINE_AUTO( vr_weapon_length, "12", FCVAR_ARCHIVE, "for weapon models without a muzzle point that aren't in the built-in table: how far they reach past the hand along the aim, game units" );
@@ -253,6 +256,11 @@ static CVAR_DEFINE_AUTO( vr_debug_unfocused, "0", 0, "developer: act as if the h
 #define VR_STAIR_RATE 12.0f // how fast the view catches up, 1/s (~13 units behind running up stairs at 4 m/s)
 #define VR_STEP_MAX 18.0f // never more than a step behind (player movement's step height)
 #define VR_STEP_SNAP 24.0f // a bigger jump in height is a teleport or respawn, follow it at once
+
+// ducking, see VR_UpdateDuckView
+#define VR_DUCK_EYE 30.0f // the game's ducked eye height above the feet: duck hull bottom 18 + view offset 12
+#define VR_DUCK_EYE_STAND 64.0f // standing: hull bottom 36 + view offset 28; vr_calibrate maps the head here
+#define VR_DUCK_RATE 10.0f // how fast the view lowers and rises, 1/s
 
 // hand collision, see VR_CollideHand
 #define VR_HAND_RADIUS 1.5f // game units (~4 cm) kept between a hand and a surface
@@ -1041,11 +1049,71 @@ static void VR_UpdateStairs( void )
 	vr.stair_lag_max = Q_max( vr.stair_lag_max, fabsf( raw - vr.feet_z ));
 }
 
-// where the STAGE floor is: the bottom of the collision box, with steps smoothed
+/*
+VR_UpdateDuckView
+
+Once per rendered frame, after the head is located. A ducked player is
+only 36 units tall (~0.9 m), less than a real crouching head, so in a
+vent the head would poke into the ceiling and the view would fade.
+While ducked the view is lowered, smoothly, until the eyes are no higher
+than the game's own ducked eye height; standing up raises it again. A
+player who crouches really low isn't lowered any further.
+*/
+static void VR_UpdateDuckView( float head_height )
+{
+	float target = 0.0f;
+
+	vr.head_height = head_height;
+
+	if( cls.state == ca_active && cl.local.usehull == 1 )
+		target = Q_max( 0.0f, head_height - VR_DUCK_EYE );
+
+	vr.duck_lower += ( target - vr.duck_lower ) * ( 1.0f - expf( -(float)host.realframetime * VR_DUCK_RATE ));
+	if( fabsf( target - vr.duck_lower ) < 0.05f )
+		vr.duck_lower = target;
+}
+
+qboolean VR_PhysicalCrouch( void )
+{
+	if( !vr.running || !vr.views_valid || vr_crouchheight.value <= 0.0f || cls.state != ca_active )
+		return false;
+
+	return vr.head_height < vr_crouchheight.value * Q_max( 1.0f, vr_worldscale.value );
+}
+
+/*
+VR_Calibrate_f
+
+Stand (or sit) normally and run it: sets vr_heightoffset so the current
+head height becomes the game's standing eye height. That fits the game
+to the player's real height, and is how seated play works: sit, and the
+view still starts at standing height. Physical crouching (vr_crouchheight)
+is measured after the offset, so it follows along.
+*/
+static void VR_Calibrate_f( void )
+{
+	float scale = Q_max( 1.0f, vr_worldscale.value );
+	float real, offset;
+
+	if( !vr.running || !vr.views_valid )
+	{
+		Con_Printf( "VR: the headset isn't tracking, can't calibrate\n" );
+		return;
+	}
+
+	real = ( vr.views[0].pose.position.y + vr.views[1].pose.position.y ) * 0.5f; // metres above the play space floor
+	offset = VR_DUCK_EYE_STAND / scale - real;
+	Cvar_SetValue( "vr_heightoffset", offset );
+	Con_Printf( "VR: head at %.2f m, vr_heightoffset set to %.2f m so it's at the game's eye height (%.2f m)\n",
+		real, offset, VR_DUCK_EYE_STAND / scale );
+}
+
+// where the STAGE floor is: the bottom of the collision box, with steps
+// smoothed, lowered while ducked so the head fits the ducked box
 static void VR_PlayerFeet( vec3_t out )
 {
 	VectorCopy( cl.simorg, out );
-	out[2] = vr.feet_valid ? vr.feet_z : VR_BoxBottom( );
+	out[2] = ( vr.feet_valid ? vr.feet_z : VR_BoxBottom( )) - vr.duck_lower;
 }
 
 static void VR_ResetRoom( void )
@@ -1829,6 +1897,7 @@ int VR_RenderEyes( const ref_viewpass_t *rvp )
 	VR_UpdateRoom( rvp->viewangles[YAW] );
 	VR_UpdateStairs( );
 	VR_HeadCenter( head );
+	VR_UpdateDuckView( head[2] );
 	{
 		// where the head faces in the play space, the sticks move relative to it
 		static const XrVector3f xr_forward = { 0.0f, 0.0f, -1.0f };
@@ -2676,6 +2745,9 @@ static void VR_Info_f( void )
 		sqrtf( vr.room_gap[0] * vr.room_gap[0] + vr.room_gap[1] * vr.room_gap[1] ), vr.fade );
 	Con_Printf( "VR: view floor %.1f, box bottom %.1f (stairs smoothed by up to %.1f units so far)\n",
 		vr.feet_valid ? vr.feet_z : VR_BoxBottom( ), VR_BoxBottom( ), vr.stair_lag_max );
+	Con_Printf( "VR: head %.2f m above the floor (crouch below %.2f m), %s, view lowered %.1f units\n",
+		vr.head_height / Q_max( 1.0f, vr_worldscale.value ), vr_crouchheight.value,
+		cl.local.usehull == 1 ? "ducked" : "standing", vr.duck_lower );
 	Con_Printf( "VR: moving at %.0f units/s (%.1f m/s) horizontally\n", sqrtf( cl.simvel[0] * cl.simvel[0] + cl.simvel[1] * cl.simvel[1] ),
 		sqrtf( cl.simvel[0] * cl.simvel[0] + cl.simvel[1] * cl.simvel[1] ) / Q_max( 1.0f, vr_worldscale.value ));
 
@@ -2770,12 +2842,14 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_handweapon );
 	Cvar_RegisterVariable( &vr_viewmodel_grip );
 	Cvar_RegisterVariable( &vr_debug_headmove );
+	Cvar_RegisterVariable( &vr_crouchheight );
 	Cvar_RegisterVariable( &vr_stairsmooth );
 	Cvar_RegisterVariable( &vr_handcollide );
 	Cvar_RegisterVariable( &vr_weapon_length );
 	Cvar_RegisterVariable( &vr_loadfade );
 	Cvar_RegisterVariable( &vr_debug_unfocused );
 	Cmd_AddCommand( "vr_recenter", VR_Recenter_f, "put the player back under the real head" );
+	Cmd_AddCommand( "vr_calibrate", VR_Calibrate_f, "stand or sit normally and run it: sets vr_heightoffset so your head is at the game's eye height" );
 
 	if( !Sys_CheckParm( "-vr" ))
 		return;

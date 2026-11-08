@@ -40,6 +40,7 @@ static CVAR_DEFINE_AUTO( vr_turnmode, "0", FCVAR_ARCHIVE, "right stick turning: 
 static CVAR_DEFINE_AUTO( vr_snapturn, "45", FCVAR_ARCHIVE, "degrees per snap turn" );
 static CVAR_DEFINE_AUTO( vr_turnspeed, "120", FCVAR_ARCHIVE, "smooth turning speed, degrees per second" );
 static CVAR_DEFINE_AUTO( vr_movespeed, "4", FCVAR_ARCHIVE, "stick movement speed at full tilt in metres per second (the original game runs at ~8); 0 = the original full speed" );
+static CVAR_DEFINE_AUTO( vr_crouchtoggle, "1", FCVAR_ARCHIVE, "the crouch button: 1 = press to toggle ducking, 0 = hold to duck" );
 static CVAR_DEFINE_AUTO( vr_movedir, "0", FCVAR_ARCHIVE, "the move stick goes where: 0 = the head looks, 1 = the left hand points" );
 static CVAR_DEFINE_AUTO( vr_debug_sticks, "0 0 0 0", 0, "developer: pretend the sticks are at \"left_x left_y right_x right_y\", to test without controllers" );
 static CVAR_DEFINE_AUTO( vr_debug_hands, "0", 0, "developer: \"1 [yaw pitch]\" fakes both hands held in front of the head (45 cm forward, 20 cm down), the right one turned by yaw/pitch degrees, to test without controllers" );
@@ -176,7 +177,15 @@ static struct
 	qboolean     menu_was_down;
 	qboolean     snap_armed; // the turn stick went back to center since the last snap
 	qboolean     flick_armed; // same for weapon flicks
+	qboolean     crouch_was_down;
+	qboolean     crouch_latched; // vr_crouchtoggle: ducked by the button
+	qboolean     crouch_debug_press; // vr_debug_crouchpress
 } vri;
+
+static void VR_DebugCrouchPress_f( void )
+{
+	vri.crouch_debug_press = true;
+}
 
 static qboolean VR_LoadInputProcs( void )
 {
@@ -253,6 +262,8 @@ qboolean VR_InitInput( void )
 	Cvar_RegisterVariable( &vr_turnspeed );
 	Cvar_RegisterVariable( &vr_movespeed );
 	Cvar_RegisterVariable( &vr_movedir );
+	Cvar_RegisterVariable( &vr_crouchtoggle );
+	Cmd_AddCommand( "vr_debug_crouchpress", VR_DebugCrouchPress_f, "developer: press the crouch button once, to test without controllers" );
 	Cvar_RegisterVariable( &vr_debug_sticks );
 	Cvar_RegisterVariable( &vr_debug_hands );
 	Cvar_RegisterVariable( &vr_aim_active );
@@ -599,6 +610,47 @@ static void VR_AimFromHand( usercmd_t *cmd )
 	VR_SetAimCvar( &vr_aim_active, 1.0f );
 }
 
+/*
+VR_CrouchButtons
+
+The held buttons, with ducking worked out: with vr_crouchtoggle the
+crouch button toggles a latched duck instead of holding it, so long vent
+crawls don't need a button held down. Crouching for real (VR_PhysicalCrouch)
+ducks too; either one keeps the player ducked. Player movement only
+stands up when there's room, so letting go in a vent stays ducked until
+the player is out.
+*/
+static int VR_CrouchButtons( void )
+{
+	int buttons = vri.buttons;
+	qboolean down = FBitSet( buttons, IN_DUCK ) || vri.crouch_debug_press;
+
+	vri.crouch_debug_press = false;
+
+	if( cls.state != ca_active || cl.local.health <= 0 )
+		vri.crouch_latched = false; // dead, loading: start the next life standing
+
+	if( vr_crouchtoggle.value )
+	{
+		ClearBits( buttons, IN_DUCK );
+		if( down && !vri.crouch_was_down )
+		{
+			vri.crouch_latched = !vri.crouch_latched;
+			Con_Reportf( "VR: crouch %s\n", vri.crouch_latched ? "on" : "off" );
+		}
+		if( vri.crouch_latched )
+			SetBits( buttons, IN_DUCK );
+	}
+	else vri.crouch_latched = false;
+
+	vri.crouch_was_down = down;
+
+	if( VR_PhysicalCrouch( ))
+		SetBits( buttons, IN_DUCK );
+
+	return buttons;
+}
+
 void VR_CreateMove( usercmd_t *cmd )
 {
 	float mx, my, h, dx, dy, fwd, side, yaw;
@@ -606,7 +658,7 @@ void VR_CreateMove( usercmd_t *cmd )
 	if( !vri.initialized || !VR_Active( ))
 		return;
 
-	cmd->buttons |= vri.buttons;
+	cmd->buttons |= VR_CrouchButtons( );
 
 	mx = VR_Deadzone( vri.move.x );
 	my = VR_Deadzone( vri.move.y );

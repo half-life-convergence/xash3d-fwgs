@@ -43,6 +43,7 @@ qboolean VR_LoadProc( XrInstance instance, const char *name, PFN_xrVoidFunction 
 const char *VR_ResultString( XrResult result );
 float VR_HeadYaw( void ); // degrees, where the head faces in the play space, game convention
 qboolean VR_HandYaw( int hand, float *yaw ); // degrees, where a hand points in the play space; false if not tracked
+qboolean VR_PhysicalCrouch( void ); // the real head is below vr_crouchheight
 qboolean VR_RightHandAim( vec3_t origin, vec3_t angles ); // the weapon hand in the world (grip position, aim angles in view convention), false if not tracked or vr_handweapon 0
 
 #define VR_LOAD_PROC( name ) VR_LoadProc( VR_GetInstance( ), #name, (PFN_xrVoidFunction *)&p##name )
