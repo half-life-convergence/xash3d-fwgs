@@ -1724,7 +1724,7 @@ void CL_RegisterResources( sizebuf_t *msg, connprotocol_t proto )
 			}
 
 #if XASH_OPENXR
-			VR_LoadWeaponModels(); // before Mod_FreeUnused, so VR models kept from the last map stay
+			VR_LoadModels(); // before Mod_FreeUnused, so VR models kept from the last map stay
 #endif
 			Mod_FreeUnused ();
 

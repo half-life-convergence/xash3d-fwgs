@@ -1781,6 +1781,7 @@ included.
 static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 {
 	int hand;
+	const model_t *held = NULL; // Half-Life's weapon model in the right hand, for the hand's grip
 
 	// hold our own VR model instead of Half-Life's where there is one;
 	// V_SetupViewModel sets the original again every frame
@@ -1788,6 +1789,7 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 	{
 		model_t *vrmodel = VR_WeaponModel( clgame.viewent.model );
 
+		held = clgame.viewent.model;
 		if( vrmodel )
 			clgame.viewent.model = vrmodel;
 	}
@@ -1872,6 +1874,11 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 		VectorCopy( view->angles, view->curstate.angles );
 		VectorCopy( view->angles, view->latched.prevangles );
 	}
+
+	// the hands go where the tracked hands are; the right one grips the weapon
+	if( !vr_handweapon.value || !vr.hand_valid[VR_HAND_RIGHT] || !Cvar_VariableValue( "r_drawviewmodel" ))
+		held = NULL;
+	VR_AddHands( vr.hand_valid, (const vec3_t *)vr.hand_origin, (const vec3_t *)vr.hand_angles, held );
 }
 
 /*
@@ -2853,6 +2860,7 @@ static void VR_Info_f( void )
 			cl.cmd.viewangles[PITCH], cl.cmd.viewangles[YAW], cl.viewangles[YAW],
 			Cvar_VariableValue( "vr_aim_active" ) ? "at the hand," : "at the eyes,",
 			Cvar_VariableValue( "vr_aim_x" ), Cvar_VariableValue( "vr_aim_y" ), Cvar_VariableValue( "vr_aim_z" ));
+		VR_HandsInfo( );
 	}
 }
 
@@ -2926,6 +2934,7 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_pinweapon );
 	Cvar_RegisterVariable( &vr_twosided );
 	VR_WeaponModelsInit( );
+	VR_HandsInit( );
 	Cvar_RegisterVariable( &vr_weapon_length );
 	Cvar_RegisterVariable( &vr_loadfade );
 	Cvar_RegisterVariable( &vr_debug_unfocused );

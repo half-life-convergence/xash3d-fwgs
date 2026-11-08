@@ -18,7 +18,7 @@ GNU General Public License for more details.
 
 #if XASH_OPENXR
 
-#include "vr.h"
+#include "vr_local.h"
 
 // Half-Life's weapon models were made for a fixed desktop camera: the arms
 // are built in, faces the camera never saw are missing, and the animations
@@ -98,6 +98,12 @@ void VR_LoadWeaponModels( void )
 		vr_num_weapon_models++;
 		Con_Reportf( "VR: %s replaces %s\n", path, mod->name );
 	}
+}
+
+void VR_LoadModels( void )
+{
+	VR_LoadWeaponModels( );
+	VR_LoadHandModel( );
 }
 
 model_t *VR_WeaponModel( const model_t *original )

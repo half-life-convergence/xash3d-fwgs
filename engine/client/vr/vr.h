@@ -87,9 +87,9 @@ struct studiohdr_s;
 void VR_MarkViewmodelArms( const char *modelname, struct studiohdr_s *phdr );
 
 // called by CL_RegisterResources while the map loads, before unused models
-// are freed (vr_weaponmodels.c): loads our VR weapon model models/vr/v_X.mdl
-// for every weapon model v_X.mdl that has one; VR_UpdateHands holds it instead
-void VR_LoadWeaponModels( void );
+// are freed (vr_weaponmodels.c): loads our own models, the VR weapon model
+// models/vr/v_X.mdl for every weapon v_X.mdl that has one, and the hands
+void VR_LoadModels( void );
 
 // extra ref_viewpass_t flags for the desktop pass of a frame whose eyes were drawn
 int VR_DesktopPassFlags( void );

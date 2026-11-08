@@ -30,6 +30,7 @@ static PFN_xrSuggestInteractionProfileBindings pxrSuggestInteractionProfileBindi
 static PFN_xrAttachSessionActionSets           pxrAttachSessionActionSets;
 static PFN_xrSyncActions                       pxrSyncActions;
 static PFN_xrGetActionStateBoolean             pxrGetActionStateBoolean;
+static PFN_xrGetActionStateFloat               pxrGetActionStateFloat;
 static PFN_xrGetActionStateVector2f            pxrGetActionStateVector2f;
 static PFN_xrGetCurrentInteractionProfile      pxrGetCurrentInteractionProfile;
 static PFN_xrCreateActionSpace                 pxrCreateActionSpace;
@@ -44,6 +45,7 @@ static CVAR_DEFINE_AUTO( vr_autocrouch, "1", FCVAR_ARCHIVE, "jumping ducks the p
 static CVAR_DEFINE_AUTO( vr_crouchtoggle, "1", FCVAR_ARCHIVE, "the crouch button: 1 = press to toggle ducking, 0 = hold to duck" );
 static CVAR_DEFINE_AUTO( vr_movedir, "0", FCVAR_ARCHIVE, "the move stick goes where: 0 = the head looks, 1 = the left hand points" );
 static CVAR_DEFINE_AUTO( vr_debug_sticks, "0 0 0 0", 0, "developer: pretend the sticks are at \"left_x left_y right_x right_y\", to test without controllers" );
+static CVAR_DEFINE_AUTO( vr_debug_fingers, "0 0 0 0", 0, "developer: pretend the triggers and grips are at \"left_trigger left_grip right_trigger right_grip\" (0 to 1), to test the hand poses without controllers" );
 static CVAR_DEFINE_AUTO( vr_debug_hands, "0", 0, "developer: \"1 [yaw pitch]\" fakes both hands held in front of the head (45 cm forward, 20 cm down), the right one turned by yaw/pitch degrees, to test without controllers" );
 
 // Hand aim for the game DLLs. Singleplayer runs client and server in this
@@ -66,6 +68,8 @@ typedef enum
 	VR_ACT_USE,
 	VR_ACT_RELOAD,
 	VR_ACT_MENU,
+	VR_ACT_FINGER_TRIGGER, // float, per hand: how far the trigger is pulled, for the hand model
+	VR_ACT_FINGER_SQUEEZE, // float, per hand: how hard the grip is squeezed, for the hand model
 	VR_ACT_GRIP_POSE, // pose, per hand: where the hand holds things
 	VR_ACT_AIM_POSE, // pose, per hand: the pointing ray
 	VR_ACT_COUNT
@@ -90,12 +94,14 @@ static const vr_action_def_t vr_action_defs[VR_ACT_COUNT] =
 	{ "use", "Use", XR_ACTION_TYPE_BOOLEAN_INPUT, IN_USE },
 	{ "reload", "Reload", XR_ACTION_TYPE_BOOLEAN_INPUT, IN_RELOAD },
 	{ "menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT, 0 },
+	{ "finger_trigger", "Index finger (hand pose)", XR_ACTION_TYPE_FLOAT_INPUT, 0 },
+	{ "finger_squeeze", "Hand closing (hand pose)", XR_ACTION_TYPE_FLOAT_INPUT, 0 },
 	{ "hand_grip", "Hand grip pose", XR_ACTION_TYPE_POSE_INPUT, 0 },
 	{ "hand_aim", "Hand aim pose", XR_ACTION_TYPE_POSE_INPUT, 0 },
 };
 
-// the pose actions are per hand
-#define VR_ACTION_IS_POSE( i ) ( vr_action_defs[i].type == XR_ACTION_TYPE_POSE_INPUT )
+// the pose and finger actions are per hand
+#define VR_ACTION_PER_HAND( i ) ( vr_action_defs[i].type == XR_ACTION_TYPE_POSE_INPUT || vr_action_defs[i].type == XR_ACTION_TYPE_FLOAT_INPUT )
 
 typedef struct
 {
@@ -112,9 +118,13 @@ typedef struct
 	{ VR_ACT_AIM_POSE, "/user/hand/left/input/aim/pose" }, \
 	{ VR_ACT_AIM_POSE, "/user/hand/right/input/aim/pose" }
 
+// both trigger and squeeze report a value on the Index and Touch profiles
+#define VR_HAND_FINGERS 	{ VR_ACT_FINGER_TRIGGER, "/user/hand/left/input/trigger/value" }, 	{ VR_ACT_FINGER_TRIGGER, "/user/hand/right/input/trigger/value" }, 	{ VR_ACT_FINGER_SQUEEZE, "/user/hand/left/input/squeeze/value" }, 	{ VR_ACT_FINGER_SQUEEZE, "/user/hand/right/input/squeeze/value" }
+
 static const vr_binding_t vr_bindings_index[] =
 {
 	VR_HAND_POSES,
+	VR_HAND_FINGERS,
 	{ VR_ACT_MOVE, "/user/hand/left/input/thumbstick" },
 	{ VR_ACT_TURN, "/user/hand/right/input/thumbstick" },
 	{ VR_ACT_FIRE, "/user/hand/right/input/trigger/click" },
@@ -129,6 +139,7 @@ static const vr_binding_t vr_bindings_index[] =
 static const vr_binding_t vr_bindings_touch[] =
 {
 	VR_HAND_POSES,
+	VR_HAND_FINGERS,
 	{ VR_ACT_MOVE, "/user/hand/left/input/thumbstick" },
 	{ VR_ACT_TURN, "/user/hand/right/input/thumbstick" },
 	{ VR_ACT_FIRE, "/user/hand/right/input/trigger/value" },
@@ -173,6 +184,7 @@ static struct
 	qboolean     menu;
 	XrVector2f   move;
 	XrVector2f   turn;
+	float        fingers[2][2]; // [left, right][trigger, squeeze], 0 to 1
 
 	// edge tracking
 	qboolean     menu_was_down;
@@ -202,6 +214,7 @@ static qboolean VR_LoadInputProcs( void )
 		&& VR_LOAD_PROC( xrAttachSessionActionSets )
 		&& VR_LOAD_PROC( xrSyncActions )
 		&& VR_LOAD_PROC( xrGetActionStateBoolean )
+		&& VR_LOAD_PROC( xrGetActionStateFloat )
 		&& VR_LOAD_PROC( xrGetActionStateVector2f )
 		&& VR_LOAD_PROC( xrGetCurrentInteractionProfile )
 		&& VR_LOAD_PROC( xrCreateActionSpace )
@@ -271,6 +284,7 @@ qboolean VR_InitInput( void )
 	Cmd_AddCommand( "vr_debug_crouchpress", VR_DebugCrouchPress_f, "developer: press the crouch button once, to test without controllers" );
 	Cvar_RegisterVariable( &vr_debug_sticks );
 	Cvar_RegisterVariable( &vr_debug_hands );
+	Cvar_RegisterVariable( &vr_debug_fingers );
 	Cvar_RegisterVariable( &vr_aim_active );
 	Cvar_RegisterVariable( &vr_aim_x );
 	Cvar_RegisterVariable( &vr_aim_y );
@@ -298,7 +312,7 @@ qboolean VR_InitInput( void )
 		Q_strncpy( info.actionName, vr_action_defs[i].name, sizeof( info.actionName ));
 		Q_strncpy( info.localizedActionName, vr_action_defs[i].title, sizeof( info.localizedActionName ));
 		info.actionType = vr_action_defs[i].type;
-		if( VR_ACTION_IS_POSE( i ))
+		if( VR_ACTION_PER_HAND( i ))
 		{
 			info.countSubactionPaths = 2;
 			info.subactionPaths = vri.hand_paths;
@@ -450,6 +464,44 @@ static XrVector2f VR_Vector( vr_action_t act )
 	return zero;
 }
 
+static float VR_HandFloat( vr_action_t act, int hand )
+{
+	XrActionStateGetInfo info = { XR_TYPE_ACTION_STATE_GET_INFO };
+	XrActionStateFloat state = { XR_TYPE_ACTION_STATE_FLOAT };
+
+	info.action = vri.actions[act];
+	info.subactionPath = vri.hand_paths[hand];
+	if( XR_SUCCEEDED( pxrGetActionStateFloat( VR_GetSession( ), &info, &state )) && state.isActive )
+		return bound( 0.0f, state.currentState, 1.0f );
+	return 0.0f;
+}
+
+/*
+VR_HandFingers
+
+How far a hand's trigger is pulled and its grip squeezed, 0 to 1, for
+the hand model's pose. vr_debug_fingers overrides it without controllers.
+*/
+void VR_HandFingers( int hand, float *trigger, float *squeeze )
+{
+	float f[4] = { 0 };
+
+	*trigger = *squeeze = 0.0f;
+	if( hand < 0 || hand > 1 )
+		return;
+
+	if( sscanf( vr_debug_fingers.string, "%f %f %f %f", &f[0], &f[1], &f[2], &f[3] ) == 4
+		&& ( f[0] || f[1] || f[2] || f[3] ))
+	{
+		*trigger = bound( 0.0f, f[hand * 2], 1.0f );
+		*squeeze = bound( 0.0f, f[hand * 2 + 1], 1.0f );
+		return;
+	}
+
+	*trigger = vri.fingers[hand][0];
+	*squeeze = vri.fingers[hand][1];
+}
+
 static void VR_ReadActions( void )
 {
 	XrActiveActionSet active = { 0 };
@@ -460,6 +512,7 @@ static void VR_ReadActions( void )
 	vri.buttons = 0;
 	vri.menu = false;
 	vri.move.x = vri.move.y = vri.turn.x = vri.turn.y = 0.0f;
+	memset( vri.fingers, 0, sizeof( vri.fingers ));
 
 	// actions only report while the session has input focus
 	if( VR_SessionFocused( ))
@@ -480,6 +533,12 @@ static void VR_ReadActions( void )
 			vri.menu = VR_Bool( VR_ACT_MENU );
 			vri.move = VR_Vector( VR_ACT_MOVE );
 			vri.turn = VR_Vector( VR_ACT_TURN );
+
+			for( i = 0; i < 2; i++ )
+			{
+				vri.fingers[i][0] = VR_HandFloat( VR_ACT_FINGER_TRIGGER, i );
+				vri.fingers[i][1] = VR_HandFloat( VR_ACT_FINGER_SQUEEZE, i );
+			}
 		}
 	}
 

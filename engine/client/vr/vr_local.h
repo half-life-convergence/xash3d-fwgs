@@ -50,6 +50,16 @@ qboolean VR_RightHandAim( vec3_t origin, vec3_t angles ); // the weapon hand in 
 void VR_WeaponModelsInit( void );                // registers its cvar, from VR_Init
 model_t *VR_WeaponModel( const model_t *original ); // our VR model held instead of original, or NULL
 qboolean VR_IsVRWeaponModel( const model_t *mod );  // one of ours (models/vr/), needs none of the fixes for Half-Life's
+void VR_LoadWeaponModels( void );
+
+// vr_hands.c
+void VR_HandsInit( void );      // registers its cvars, from VR_Init
+void VR_LoadHandModel( void );  // with the map, from VR_LoadModels
+void VR_AddHands( const qboolean valid[2], const vec3_t origin[2], const vec3_t angles[2], const model_t *held ); // end of VR_UpdateHands
+void VR_HandsInfo( void );      // for vr_info
+
+// vr_input.c
+void VR_HandFingers( int hand, float *trigger, float *squeeze ); // 0 to 1, for the hand poses
 
 #define VR_LOAD_PROC( name ) VR_LoadProc( VR_GetInstance( ), #name, (PFN_xrVoidFunction *)&p##name )
 
