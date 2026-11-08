@@ -46,6 +46,8 @@ qboolean VR_HandYaw( int hand, float *yaw ); // degrees, where a hand points in 
 qboolean VR_PhysicalCrouch( void ); // the real head is below vr_crouchheight
 qboolean VR_RightHandAim( vec3_t origin, vec3_t angles ); // the weapon hand in the world (grip position, aim angles in view convention), false if not tracked or vr_handweapon 0
 
+extern convar_t vr_patches; // vr_patch.c, registered by VR_Init
+
 #define VR_LOAD_PROC( name ) VR_LoadProc( VR_GetInstance( ), #name, (PFN_xrVoidFunction *)&p##name )
 
 //

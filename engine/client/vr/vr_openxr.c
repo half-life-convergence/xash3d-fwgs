@@ -2908,6 +2908,7 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_hidearms );
 	Cvar_RegisterVariable( &vr_pinweapon );
 	Cvar_RegisterVariable( &vr_twosided );
+	Cvar_RegisterVariable( &vr_patches );
 	Cvar_RegisterVariable( &vr_weapon_length );
 	Cvar_RegisterVariable( &vr_loadfade );
 	Cvar_RegisterVariable( &vr_debug_unfocused );

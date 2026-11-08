@@ -21,6 +21,7 @@ GNU General Public License for more details.
 #include "shake.h"
 #include "input.h"
 #include "eiface.h"
+#include "vr/vr.h"
 
 #if XASH_LOW_MEMORY != 2
 int CL_UPDATE_BACKUP = SINGLEPLAYER_BACKUP;
@@ -1722,6 +1723,9 @@ void CL_RegisterResources( sizebuf_t *msg, connprotocol_t proto )
 					Mod_FreeModel( mod );
 			}
 
+#if XASH_OPENXR
+			VR_LoadPatchModels(); // before Mod_FreeUnused, so patches kept from the last map stay
+#endif
 			Mod_FreeUnused ();
 
 			if( host_developer.value <= DEV_NONE )
