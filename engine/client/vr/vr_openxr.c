@@ -250,6 +250,7 @@ static CVAR_DEFINE_AUTO( vr_debug_headmove, "0 0", 0, "developer: move the track
 static CVAR_DEFINE_AUTO( vr_crouchheight, "1.2", FCVAR_ARCHIVE, "the player ducks when the real head is lower than this many metres (after vr_heightoffset); 0 = no physical crouching" );
 static CVAR_DEFINE_AUTO( vr_stairsmooth, "1", FCVAR_ARCHIVE, "smooth the view up and down stairs and steps instead of popping" );
 static CVAR_DEFINE_AUTO( vr_hidearms, "1", FCVAR_ARCHIVE, "leave out the arms built into Half-Life's weapon models while the weapon is in the hand" );
+static CVAR_DEFINE_AUTO( vr_pinweapon, "1", FCVAR_ARCHIVE, "keep the weapon still in the hand while its animations play (reloads, draws); read by the client's studio renderer" );
 static int VR_ViewmodelFlags( void );
 static CVAR_DEFINE_AUTO( vr_handcollide, "1", FCVAR_ARCHIVE, "hands and the weapon stop at walls instead of going through them" );
 static CVAR_DEFINE_AUTO( vr_weapon_length, "12", FCVAR_ARCHIVE, "for weapon models without a muzzle point that aren't in the built-in table: how far they reach past the hand along the aim, game units" );
@@ -2895,6 +2896,7 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_stairsmooth );
 	Cvar_RegisterVariable( &vr_handcollide );
 	Cvar_RegisterVariable( &vr_hidearms );
+	Cvar_RegisterVariable( &vr_pinweapon );
 	Cvar_RegisterVariable( &vr_weapon_length );
 	Cvar_RegisterVariable( &vr_loadfade );
 	Cvar_RegisterVariable( &vr_debug_unfocused );
