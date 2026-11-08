@@ -2109,6 +2109,11 @@ static void R_StudioDrawPoints( void )
 		}
 	}
 
+	// VR: the weapon in the hand can be turned around, so where the model
+	// leaves out faces the desktop camera never saw, show the far side's inside
+	if( FBitSet( RI.rvp.flags, RF_VIEWMODEL_TWOSIDED ) && RI.currententity == tr.viewent )
+		GL_Cull( GL_NONE );
+
 	for( int j = 0; j < m_pSubModel->nummesh; j++ )
 	{
 		float	oldblend = tr.blend;
@@ -3400,6 +3405,10 @@ void R_DrawViewModel( void )
 
 	// restore depth range
 	pglDepthRange( gldepthmin, gldepthmax );
+
+	// and culling, R_StudioDrawPoints only sets it while it is enabled
+	if( FBitSet( RI.rvp.flags, RF_VIEWMODEL_TWOSIDED ))
+		GL_Cull( GL_FRONT );
 }
 
 /*

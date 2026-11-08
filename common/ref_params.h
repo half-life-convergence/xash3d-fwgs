@@ -97,6 +97,7 @@ typedef struct ref_overview_s
 #define RF_REPEAT_PASS	(1<<6)		// another view of a frame that was already drawn once: no time step, no viewmodel events
 #define RF_WORLD_VIEWMODEL	(1<<7)		// the viewmodel is placed in the world (VR hand): normal depth range, no squeezing in front of walls
 #define RF_VIEWMODEL_NOARMS	(1<<8)		// leave out the viewmodel meshes marked STUDIO_NF_VR_ARM (VR hand holds the weapon)
+#define RF_VIEWMODEL_TWOSIDED	(1<<9)		// no back-face culling on the viewmodel (VR: the weapon can be turned around)
 
 // intermediate struct for viewpass (or just a single frame)
 typedef struct ref_viewpass_s

@@ -251,6 +251,7 @@ static CVAR_DEFINE_AUTO( vr_crouchheight, "1.2", FCVAR_ARCHIVE, "the player duck
 static CVAR_DEFINE_AUTO( vr_stairsmooth, "1", FCVAR_ARCHIVE, "smooth the view up and down stairs and steps instead of popping" );
 static CVAR_DEFINE_AUTO( vr_hidearms, "1", FCVAR_ARCHIVE, "leave out the arms built into Half-Life's weapon models while the weapon is in the hand" );
 static CVAR_DEFINE_AUTO( vr_pinweapon, "1", FCVAR_ARCHIVE, "keep the weapon still in the hand while its animations play (reloads, draws); read by the client's studio renderer" );
+static CVAR_DEFINE_AUTO( vr_twosided, "1", FCVAR_ARCHIVE, "draw the weapon in the hand without back-face culling, so faces Half-Life left out of the model show the far side instead of a hole" );
 static int VR_ViewmodelFlags( void );
 static CVAR_DEFINE_AUTO( vr_handcollide, "1", FCVAR_ARCHIVE, "hands and the weapon stop at walls instead of going through them" );
 static CVAR_DEFINE_AUTO( vr_weapon_length, "12", FCVAR_ARCHIVE, "for weapon models without a muzzle point that aren't in the built-in table: how far they reach past the hand along the aim, game units" );
@@ -2116,13 +2117,22 @@ static qboolean VR_GameLoading( void )
 /*
 VR_ViewmodelFlags
 
-The weapon is in the tracked hand: its built-in arms would float behind it.
+The weapon is in the tracked hand: its built-in arms would float behind
+it, and it can be turned to show sides the desktop camera never saw.
 */
 static int VR_ViewmodelFlags( void )
 {
-	if( vr_hidearms.value && vr_handweapon.value && vr.hand_valid[VR_HAND_RIGHT] )
-		return RF_VIEWMODEL_NOARMS;
-	return 0;
+	int flags = 0;
+
+	if( !vr_handweapon.value || !vr.hand_valid[VR_HAND_RIGHT] )
+		return 0;
+
+	if( vr_hidearms.value )
+		SetBits( flags, RF_VIEWMODEL_NOARMS );
+	if( vr_twosided.value )
+		SetBits( flags, RF_VIEWMODEL_TWOSIDED );
+
+	return flags;
 }
 
 int VR_DesktopPassFlags( void )
@@ -2897,6 +2907,7 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_handcollide );
 	Cvar_RegisterVariable( &vr_hidearms );
 	Cvar_RegisterVariable( &vr_pinweapon );
+	Cvar_RegisterVariable( &vr_twosided );
 	Cvar_RegisterVariable( &vr_weapon_length );
 	Cvar_RegisterVariable( &vr_loadfade );
 	Cvar_RegisterVariable( &vr_debug_unfocused );
