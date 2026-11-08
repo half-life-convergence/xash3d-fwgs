@@ -3344,8 +3344,10 @@ void R_DrawViewModel( void )
 	if( !RI.currententity->model )
 		return;
 
-	// adjust the depth range to prevent view model from poking into walls
-	pglDepthRange( gldepthmin, gldepthmin + VIEWMODEL_DEPTH_RANGE * ( gldepthmax - gldepthmin ));
+	// adjust the depth range to prevent view model from poking into walls,
+	// unless it really sits in the world and is kept out of walls (VR hand)
+	if( !FBitSet( RI.rvp.flags, RF_WORLD_VIEWMODEL ))
+		pglDepthRange( gldepthmin, gldepthmin + VIEWMODEL_DEPTH_RANGE * ( gldepthmax - gldepthmin ));
 	RI.currentmodel = RI.currententity->model;
 
 	switch( RI.currententity->model->type )

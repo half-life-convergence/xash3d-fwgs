@@ -24,6 +24,8 @@ GNU General Public License for more details.
 #include "const.h" // kRenderTransTexture
 #include "pm_local.h" // PM_CL_TraceLine flags
 #include "sound.h" // snd.origin, the listener, for vr_info
+#include "mod_local.h" // Mod_StudioExtradata, for the weapon's muzzle
+#include "studio.h" // studiohdr_t
 #if XASH_SDL == 2
 #include <SDL.h> // SDL_GL_SetSwapInterval for the desktop mirror window
 #endif
@@ -183,8 +185,18 @@ static struct
 	float    fade; // head-in-wall fade, 0..1
 	float    head_yaw; // degrees, where the head faces in the play space, for head-relative stick movement
 
-	// hands in the world, this frame: grip position, aim direction
+	// hands in the world, this frame: grip position, aim direction.
+	// hand_origin is where the hand is drawn, kept out of walls; the
+	// controller itself is at hand_tracked (see VR_CollideHand)
 	qboolean hand_valid[2];
+	vec3_t   hand_tracked[2];
+	qboolean hand_prev_valid[2]; // hand_origin holds last frame's drawn hand
+	qboolean hand_separated[2]; // held back by a wall, easing back to the tracked hand
+	qboolean hand_blocked[2]; // touching a wall this frame
+	qboolean hand_at_head[2]; // pushed out of the player's head this frame
+	model_t  *muzzle_model; // the weapon model muzzle_local belongs to
+	vec3_t   muzzle_local; // the end of the weapon relative to the hand: forward, right, up
+	qboolean muzzle_measured; // muzzle_local comes from the model's shape
 	vec3_t   hand_origin[2];
 	vec3_t   hand_angles[2];
 
@@ -227,8 +239,19 @@ static CVAR_DEFINE_AUTO( vr_msaa, "4", FCVAR_ARCHIVE, "multisample anti-aliasing
 static CVAR_DEFINE_AUTO( vr_handweapon, "1", FCVAR_ARCHIVE, "the weapon follows the right hand instead of the camera" );
 static CVAR_DEFINE_AUTO( vr_viewmodel_grip, "12 6 -9", FCVAR_ARCHIVE, "where the hand holds the weapon model, \"forward right up\" in model units from its origin" );
 static CVAR_DEFINE_AUTO( vr_debug_headmove, "0 0", 0, "developer: move the tracked head by \"forward left\" metres in the play space, to test room scale without a headset" );
+static CVAR_DEFINE_AUTO( vr_handcollide, "1", FCVAR_ARCHIVE, "hands and the weapon stop at walls instead of going through them" );
+static CVAR_DEFINE_AUTO( vr_weapon_length, "12", FCVAR_ARCHIVE, "for weapon models without a muzzle point that aren't in the built-in table: how far they reach past the hand along the aim, game units" );
 static CVAR_DEFINE_AUTO( vr_loadfade, "0.5", FCVAR_ARCHIVE, "seconds the view takes to fade in after loading, 0 = no fade" );
 static CVAR_DEFINE_AUTO( vr_debug_unfocused, "0", 0, "developer: act as if the headset lost focus (headset off, system menu open), to test pausing without a headset" );
+
+// hand collision, see VR_CollideHand
+#define VR_HAND_RADIUS 1.5f // game units (~4 cm) kept between a hand and a surface
+#define VR_HAND_RESET 12.0f // drawn and tracked hand further apart (~30 cm): start over from the eyes
+#define VR_HAND_EASE 20.0f // how fast a freed hand catches up, 1/s
+#define VR_BARREL_MARGIN 2.0f // kept between the muzzle and a wall
+#define VR_HEAD_RADIUS_GUN 7.0f // the weapon stays this far from the head center (~18 cm, room for the barrel's thickness)
+#define VR_HEAD_RADIUS_HAND 4.0f // an empty hand (~10 cm)
+#define VR_GUN_REAR 4.0f // the weapon reaches this far behind the grip, for the head check
 
 // loading transitions, see VR_UpdateTransition
 #define VR_TRANSITION_NONE    0 // playing, the eyes are submitted
@@ -1224,6 +1247,381 @@ static void VR_FakeHandPose( int hand, XrPosef *out )
 }
 
 /*
+VR_HandTrace
+
+Point trace against the world and brush entities (doors, lifts, trains),
+ignoring studio models so hands don't snag on NPCs. On a hit, end is the
+hit point moved off the surface by the hand's radius; returns the
+surface normal in normal, or false if nothing was hit.
+*/
+static qboolean VR_HandTrace( const vec3_t start, vec3_t end, vec3_t normal )
+{
+	pmtrace_t tr = CL_TraceLine( (float *)start, end, PM_STUDIO_IGNORE );
+
+	if( tr.fraction >= 1.0f && !tr.startsolid && !tr.allsolid )
+		return false;
+
+	VectorCopy( tr.plane.normal, normal );
+	VectorMA( tr.endpos, VR_HAND_RADIUS, normal, end );
+	return true;
+}
+
+/*
+VR_MuzzleTable
+
+Fallback when a weapon model's shape can't be read (no vertices, its idle
+animation stored in a separate file): how far it reaches past the hand
+along the aim, in game units. Others fall back to vr_weapon_length.
+*/
+static const struct
+{
+	const char *model;
+	float length;
+} vr_muzzle_table[] =
+{
+	{ "v_crowbar", 16.0f },
+	{ "v_crossbow", 20.0f },
+	{ "v_rpg", 20.0f },
+	{ "v_hgun", 10.0f },
+	{ "v_grenade", 4.0f },
+	{ "v_satchel", 6.0f },
+	{ "v_tripmine", 8.0f },
+	{ "v_squeak", 6.0f },
+};
+
+/*
+VR_WeaponTip
+
+The point of a weapon model that reaches furthest forward (the end of
+the barrel), in model space, from its real shape: the skeleton is posed
+at the first frame of the first animation (the idle) and every vertex of
+the default body is moved onto its bone. Neither the muzzle attachment
+(often partway down the barrel, missing on the crossbow and RPG) nor the
+model's bounding boxes (set by hand per animation) are reliable enough.
+Runs once per weapon model, when it's first held.
+*/
+#define VR_MAX_TIP_BONES 128
+static qboolean VR_WeaponTip( model_t *model, vec3_t tip )
+{
+	studiohdr_t *hdr = Mod_StudioExtradata( model );
+	static matrix3x4 bones[VR_MAX_TIP_BONES];
+	mstudiobodyparts_t *parts;
+	mstudioseqdesc_t *seq;
+	mstudiobone_t *pbones;
+	mstudioanim_t *panim;
+	qboolean found = false;
+	int i, j;
+
+	if( !hdr || hdr->numbones <= 0 || hdr->numbones > VR_MAX_TIP_BONES || hdr->numseq <= 0 )
+		return false;
+
+	seq = (mstudioseqdesc_t *)((byte *)hdr + hdr->seqindex);
+	if( seq->seqgroup != 0 )
+		return false; // animation in a separate file
+
+	pbones = (mstudiobone_t *)((byte *)hdr + hdr->boneindex);
+	panim = (mstudioanim_t *)((byte *)hdr + seq->animindex);
+
+	// bones come parents first
+	for( i = 0; i < hdr->numbones; i++ )
+	{
+		matrix3x4 local;
+		vec3_t pos;
+		vec4_t q;
+
+		R_StudioCalcBones( 0, 0.0f, &pbones[i], &panim[i], NULL, pos, q );
+		Matrix3x4_FromOriginQuat( local, q, pos );
+
+		if( pbones[i].parent < 0 || pbones[i].parent >= i )
+			Matrix3x4_Copy( bones[i], local );
+		else Matrix3x4_ConcatTransforms( bones[i], bones[pbones[i].parent], local );
+	}
+
+	parts = (mstudiobodyparts_t *)((byte *)hdr + hdr->bodypartindex);
+	for( i = 0; i < hdr->numbodyparts; i++ )
+	{
+		mstudiomodel_t *sub;
+		const vec3_t *verts;
+		const byte *vertbone;
+
+		if( parts[i].nummodels <= 0 )
+			continue;
+
+		sub = (mstudiomodel_t *)((byte *)hdr + parts[i].modelindex); // the default body
+		verts = (const vec3_t *)((byte *)hdr + sub->vertindex);
+		vertbone = (const byte *)hdr + sub->vertinfoindex;
+
+		for( j = 0; j < sub->numverts; j++ )
+		{
+			vec3_t v;
+
+			if( vertbone[j] >= hdr->numbones )
+				continue;
+
+			Matrix3x4_VectorTransform( bones[vertbone[j]], verts[j], v );
+			if( !found || v[0] > tip[0] )
+			{
+				VectorCopy( v, tip );
+				found = true;
+			}
+		}
+	}
+
+	return found;
+}
+
+/*
+VR_MeasureMuzzle
+
+Where the end of the weapon is relative to the hand, in the hand's axes
+(forward, right, up), for the barrel and head checks. Worked out once per
+weapon model from its real shape (VR_WeaponTip); models whose shape
+can't be read use VR_MuzzleTable or vr_weapon_length straight along the
+aim.
+*/
+static void VR_MeasureMuzzle( void )
+{
+	cl_entity_t *view = &clgame.viewent;
+	float g[3] = { 0.0f, 0.0f, 0.0f };
+	vec3_t tip;
+	size_t i;
+
+	if( !view->model || view->model->type != mod_studio )
+	{
+		vr.muzzle_model = NULL;
+		return;
+	}
+
+	if( view->model == vr.muzzle_model && !FBitSet( vr_viewmodel_grip.flags, FCVAR_CHANGED ))
+		return;
+
+	ClearBits( vr_viewmodel_grip.flags, FCVAR_CHANGED );
+	vr.muzzle_model = view->model;
+	VectorClear( vr.muzzle_local );
+
+	if( VR_WeaponTip( view->model, tip ))
+	{
+		// model space is forward, left, up; vr_viewmodel_grip is forward, right, up
+		sscanf( vr_viewmodel_grip.string, "%f %f %f", &g[0], &g[1], &g[2] );
+		vr.muzzle_local[0] = tip[0] - g[0];
+		vr.muzzle_local[1] = -tip[1] - g[1];
+		vr.muzzle_local[2] = tip[2] - g[2];
+		vr.muzzle_measured = true;
+		return;
+	}
+
+	vr.muzzle_measured = false;
+	vr.muzzle_local[0] = Q_max( 0.0f, vr_weapon_length.value );
+	for( i = 0; i < ARRAYSIZE( vr_muzzle_table ); i++ )
+	{
+		if( Q_stristr( view->model->name, vr_muzzle_table[i].model ))
+			vr.muzzle_local[0] = vr_muzzle_table[i].length;
+	}
+}
+
+// the muzzle's offset from a hand at angles, in world axes
+static void VR_MuzzleOffset( const vec3_t angles, vec3_t out )
+{
+	vec3_t f, r, u;
+
+	AngleVectors( angles, f, r, u );
+	VectorScale( f, vr.muzzle_local[0], out );
+	VectorMA( out, vr.muzzle_local[1], r, out );
+	VectorMA( out, vr.muzzle_local[2], u, out );
+}
+
+/*
+VR_HeadPush
+
+Keeps a hand, or the weapon from just behind the grip to the muzzle, at
+least a head radius away from the head center, so it can't be pushed
+into the player's own face. Moves pos straight away from the head;
+returns true if it had to.
+*/
+static qboolean VR_HeadPush( int hand, qboolean weapon, vec3_t pos )
+{
+	vec3_t a, b, ab, c, away, f;
+	float t, d, radius = weapon ? VR_HEAD_RADIUS_GUN : VR_HEAD_RADIUS_HAND;
+
+	VectorCopy( pos, a );
+	VectorCopy( pos, b );
+	if( weapon )
+	{
+		vec3_t muzzle;
+
+		AngleVectors( vr.hand_angles[hand], f, NULL, NULL );
+		VectorMA( pos, -VR_GUN_REAR, f, a );
+		VR_MuzzleOffset( vr.hand_angles[hand], muzzle );
+		VectorAdd( pos, muzzle, b );
+	}
+
+	// the point of a-b closest to the head
+	VectorSubtract( b, a, ab );
+	t = DotProduct( ab, ab );
+	t = t > 0.0001f ? bound( 0.0f, ( DotProduct( vr.head_origin, ab ) - DotProduct( a, ab )) / t, 1.0f ) : 0.0f;
+	VectorMA( a, t, ab, c );
+
+	VectorSubtract( c, vr.head_origin, away );
+	d = VectorLength( away );
+	if( d >= radius )
+		return false;
+
+	if( d < 0.01f )
+	{
+		// dead center: push the hand away from the head instead
+		VectorSubtract( pos, vr.head_origin, away );
+		d = VectorLength( away );
+		if( d < 0.01f )
+		{
+			AngleVectors( vr.head_angles, away, NULL, NULL );
+			d = 1.0f;
+		}
+		VectorScale( away, 1.0f / d, away );
+		VectorMA( pos, radius, away, pos );
+		return true;
+	}
+
+	VectorMA( pos, ( radius - d ) / d, away, pos );
+	return true;
+}
+
+/*
+VR_CollideHand
+
+Keeps the drawn hand out of walls (simplified Alyx style) and out of the
+player's own head. The tracked position is vr.hand_tracked; what
+everything else uses (the weapon model, where shots start, vr_info) is
+vr.hand_origin, the drawn position:
+
+- the target is the tracked position, pushed out of the head first.
+- the hand moves from where it was drawn last frame toward the target;
+  a wall stops it, and the rest of the move slides along the wall once,
+  so a hand pressed into a wall can still move sideways.
+- the gun hand also traces from the grip to the end of the barrel (from
+  the weapon model's shape, see VR_MeasureMuzzle): if the barrel would go into a
+  wall, the hand is pushed back along that line, so the muzzle stops at
+  the surface and shots never start behind a wall. If that pushes the
+  gun into the head, walls win.
+- once the target is clear again, the drawn hand eases back to it
+  instead of snapping.
+- the move starts at the player's eyes instead (the collision box, which
+  is never inside a wall) when there was no hand last frame, or the hands
+  are more than VR_HAND_RESET apart: a snap turn, a teleport, a level
+  change, or a door that closed on the hand.
+
+Only the position changes; the hand keeps the tracked rotation.
+*/
+static void VR_CollideHand( int hand, qboolean weapon )
+{
+	vec3_t target, anchor, end, normal, rest;
+	pmtrace_t tr;
+	qboolean blocked = false;
+	float d;
+
+	vr.hand_blocked[hand] = false;
+	vr.hand_at_head[hand] = false;
+
+	if( !vr_handcollide.value || cls.state != ca_active || !cl.worldmodel )
+	{
+		VectorCopy( vr.hand_tracked[hand], vr.hand_origin[hand] );
+		vr.hand_prev_valid[hand] = false;
+		vr.hand_separated[hand] = false;
+		return;
+	}
+
+	VectorCopy( vr.hand_tracked[hand], target );
+	vr.hand_at_head[hand] = VR_HeadPush( hand, weapon, target );
+
+	// where the move starts: last frame's drawn hand if it's still usable
+	if( vr.hand_prev_valid[hand] && VectorDistance( vr.hand_origin[hand], target ) < VR_HAND_RESET
+		&& !CL_TraceLine( vr.hand_origin[hand], vr.hand_origin[hand], PM_STUDIO_IGNORE ).startsolid )
+	{
+		VectorCopy( vr.hand_origin[hand], anchor );
+	}
+	else
+	{
+		VectorCopy( cl.simorg, anchor );
+		anchor[2] += cl.viewheight[2];
+		vr.hand_separated[hand] = false;
+	}
+
+	VectorCopy( target, end );
+	if( VR_HandTrace( anchor, end, normal ))
+	{
+		// slide the rest of the move along the wall, once
+		blocked = true;
+		VectorSubtract( target, end, rest );
+		d = DotProduct( rest, normal );
+		VectorMA( rest, -d, normal, rest );
+		VectorCopy( end, anchor );
+		VectorAdd( anchor, rest, end );
+		VR_HandTrace( anchor, end, normal );
+	}
+
+	if( weapon )
+	{
+		// the barrel: push the hand back along grip -> muzzle until the muzzle is out
+		vec3_t offset, muzzle, dir;
+		float len;
+
+		VR_MuzzleOffset( vr.hand_angles[hand], offset );
+		len = VectorLength( offset );
+
+		if( len > 0.1f )
+		{
+			VectorScale( offset, 1.0f / len, dir );
+			VectorMA( end, len + VR_BARREL_MARGIN, dir, muzzle );
+			tr = CL_TraceLine( end, muzzle, PM_STUDIO_IGNORE );
+
+			if( tr.fraction < 1.0f && !tr.startsolid )
+			{
+				vec3_t back;
+
+				blocked = true;
+				VectorMA( end, -( 1.0f - tr.fraction ) * ( len + VR_BARREL_MARGIN ), dir, back );
+				VectorCopy( end, anchor );
+				VR_HandTrace( anchor, back, normal ); // never through a wall behind the hand
+				VectorCopy( back, end );
+
+				// pushed back into the face? move it out again, but walls win
+				VectorCopy( end, back );
+				if( VR_HeadPush( hand, weapon, back ))
+				{
+					VectorCopy( end, anchor );
+					VR_HandTrace( anchor, back, normal );
+					VectorCopy( back, end );
+					vr.hand_at_head[hand] = true;
+				}
+			}
+		}
+	}
+
+	if( blocked )
+	{
+		vr.hand_separated[hand] = true;
+		vr.hand_blocked[hand] = true;
+	}
+	else if( vr.hand_separated[hand] )
+	{
+		// clear again: ease back to the target over a few frames; the path
+		// toward it was just traced clear
+		float k = 1.0f - expf( -(float)host.realframetime * VR_HAND_EASE );
+
+		VectorSubtract( target, vr.hand_origin[hand], rest );
+		VectorMA( vr.hand_origin[hand], k, rest, end );
+
+		if( VectorDistance( end, target ) < 0.25f )
+		{
+			VectorCopy( target, end );
+			vr.hand_separated[hand] = false;
+		}
+	}
+
+	VectorCopy( end, vr.hand_origin[hand] );
+	vr.hand_prev_valid[hand] = true;
+}
+
+/*
 VR_UpdateHands
 
 Both hands in the world for this frame, placed exactly like the eyes
@@ -1237,6 +1635,8 @@ included.
 static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 {
 	int hand;
+
+	VR_MeasureMuzzle( ); // once per weapon model
 
 	for( hand = 0; hand < 2; hand++ )
 	{
@@ -1275,12 +1675,15 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 			|| !VR_GetHandPose( hand, VR_POSE_AIM, vr.display_time, vr.space, &aim ))
 		{
 			vr.hand_valid[hand] = false;
+			vr.hand_prev_valid[hand] = false;
 			continue;
 		}
 
-		VR_EyeView( rvp, &grip, head, vr.hand_origin[hand], dummy );
+		VR_EyeView( rvp, &grip, head, vr.hand_tracked[hand], dummy );
 		VR_EyeView( rvp, &aim, head, dummy, vr.hand_angles[hand] );
 		vr.hand_valid[hand] = true;
+
+		VR_CollideHand( hand, hand == VR_HAND_RIGHT && vr_handweapon.value && clgame.viewent.model );
 	}
 
 	if( vr_handweapon.value && vr.hand_valid[VR_HAND_RIGHT] )
@@ -1391,9 +1794,8 @@ int VR_RenderEyes( const ref_viewpass_t *rvp )
 		if( fwd[0] != 0.0f || fwd[1] != 0.0f )
 			vr.head_yaw = RAD2DEG( atan2f( fwd[1], fwd[0] ));
 	}
-	VR_UpdateHands( rvp, head );
 	{
-		// the listener sits between the eyes and faces where the head faces:
+		// the head center: the sound listener sits here, and hands keep out of it;
 		// the eye positions averaged, the eye orientations blended (equal on
 		// most headsets, canted displays tilt them apart a little)
 		const XrQuaternionf *a = &vr.views[0].pose.orientation, *b = &vr.views[1].pose.orientation;
@@ -1421,6 +1823,7 @@ int VR_RenderEyes( const ref_viewpass_t *rvp )
 
 		VR_EyeView( rvp, &center, head, vr.head_origin, vr.head_angles );
 	}
+	VR_UpdateHands( rvp, head ); // after the head center, the hands keep out of the head
 	{
 		// the head's place in the world, for the wall check
 		float yaw = DEG2RAD( rvp->viewangles[YAW] );
@@ -1483,6 +1886,8 @@ int VR_RenderEyes( const ref_viewpass_t *rvp )
 			eye_rvp.fov_tan[2] = tanf( fov->angleDown );
 			eye_rvp.fov_tan[3] = tanf( fov->angleUp );
 			SetBits( eye_rvp.flags, RF_EXTERNAL_TARGET|RF_ASYMMETRIC_FOV );
+			if( vr_handweapon.value && vr.hand_valid[VR_HAND_RIGHT] && vr_handcollide.value )
+				SetBits( eye_rvp.flags, RF_WORLD_VIEWMODEL ); // the gun is in the hand and kept out of walls
 			if( stepped )
 				SetBits( eye_rvp.flags, RF_REPEAT_PASS );
 
@@ -2230,15 +2635,20 @@ static void VR_Info_f( void )
 		for( hand = 0; hand < 2; hand++ )
 		{
 			if( vr.hand_valid[hand] )
-				Con_Printf( "VR: %s hand at %.1f %.1f %.1f, aiming %.0f %.0f %.0f\n", hand ? "right" : "left",
+				Con_Printf( "VR: %s hand at %.1f %.1f %.1f, aiming %.0f %.0f %.0f, %s, %.1f units from the controller\n", hand ? "right" : "left",
 					vr.hand_origin[hand][0], vr.hand_origin[hand][1], vr.hand_origin[hand][2],
-					vr.hand_angles[hand][0], vr.hand_angles[hand][1], vr.hand_angles[hand][2] );
+					vr.hand_angles[hand][0], vr.hand_angles[hand][1], vr.hand_angles[hand][2],
+					vr.hand_blocked[hand] ? "against a wall" : vr.hand_at_head[hand] ? "kept out of the head" : vr.hand_separated[hand] ? "easing back" : "free",
+					VectorDistance( vr.hand_origin[hand], vr.hand_tracked[hand] ));
 			else Con_Printf( "VR: %s hand not tracked\n", hand ? "right" : "left" );
 		}
 		Con_Printf( "VR: head at %.1f %.1f %.1f facing %.0f %.0f %.0f, sound listener at %.1f %.1f %.1f\n",
 			vr.head_origin[0], vr.head_origin[1], vr.head_origin[2],
 			vr.head_angles[0], vr.head_angles[1], vr.head_angles[2],
 			snd.origin[0], snd.origin[1], snd.origin[2] );
+		if( vr.muzzle_model )
+			Con_Printf( "VR: %s muzzle %.1f %.1f %.1f from the hand (%s)\n", vr.muzzle_model->name,
+				vr.muzzle_local[0], vr.muzzle_local[1], vr.muzzle_local[2], vr.muzzle_measured ? "from the model's shape" : "length table" );
 		Con_Printf( "VR: weapon model at %.1f %.1f %.1f\n", clgame.viewent.origin[0], clgame.viewent.origin[1], clgame.viewent.origin[2] );
 		Con_Printf( "VR: last command aims %.0f %.0f, body yaw %.0f, gun start %s %.1f %.1f %.1f from the player\n",
 			cl.cmd.viewangles[PITCH], cl.cmd.viewangles[YAW], cl.viewangles[YAW],
@@ -2301,6 +2711,8 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_handweapon );
 	Cvar_RegisterVariable( &vr_viewmodel_grip );
 	Cvar_RegisterVariable( &vr_debug_headmove );
+	Cvar_RegisterVariable( &vr_handcollide );
+	Cvar_RegisterVariable( &vr_weapon_length );
 	Cvar_RegisterVariable( &vr_loadfade );
 	Cvar_RegisterVariable( &vr_debug_unfocused );
 	Cmd_AddCommand( "vr_recenter", VR_Recenter_f, "put the player back under the real head" );

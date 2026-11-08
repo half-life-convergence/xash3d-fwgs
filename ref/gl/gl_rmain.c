@@ -390,7 +390,11 @@ static void R_SetupProjectionMatrix( matrix4x4 m )
 
 	if( FBitSet( RI.rvp.flags, RF_ASYMMETRIC_FOV ))
 	{
-		// VR eye: off-center frustum straight from the headset's per-eye angles
+		// VR eye: off-center frustum straight from the headset's per-eye angles.
+		// The near plane comes in to ~4 cm: hands and the weapon get much closer
+		// to the eyes than a desktop camera ever does, and 4 units (~10 cm)
+		// cut them open right in front of the face
+		zNear = 1.5f;
 		Matrix4x4_CreateProjection( m,
 			zNear * RI.rvp.fov_tan[1], zNear * RI.rvp.fov_tan[0],
 			zNear * RI.rvp.fov_tan[3], zNear * RI.rvp.fov_tan[2], zNear, zFar );
