@@ -74,8 +74,9 @@ void VR_MarkViewmodelArms( const char *modelname, studiohdr_t *phdr )
 	for( int i = 0; i < phdr->numtextures; i++ )
 		ClearBits( ptexture[i].flags, STUDIO_NF_VR_ARM );
 
-	// only weapon models, scientists and guards keep their hands
-	if( Q_strnicmp( COM_FileWithoutPath( modelname ), "v_", 2 ))
+	// only Half-Life's weapon models: scientists and guards keep their
+	// hands, and our own VR models (models/vr/) have no arms built in
+	if( Q_strnicmp( COM_FileWithoutPath( modelname ), "v_", 2 ) || !Q_strnicmp( modelname, "models/vr/", 10 ))
 		return;
 
 	for( int i = 0; i < phdr->numtextures; i++ )

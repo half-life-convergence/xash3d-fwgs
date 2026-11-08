@@ -46,7 +46,10 @@ qboolean VR_HandYaw( int hand, float *yaw ); // degrees, where a hand points in 
 qboolean VR_PhysicalCrouch( void ); // the real head is below vr_crouchheight
 qboolean VR_RightHandAim( vec3_t origin, vec3_t angles ); // the weapon hand in the world (grip position, aim angles in view convention), false if not tracked or vr_handweapon 0
 
-extern convar_t vr_patches; // vr_patch.c, registered by VR_Init
+// vr_weaponmodels.c
+void VR_WeaponModelsInit( void );                // registers its cvar, from VR_Init
+model_t *VR_WeaponModel( const model_t *original ); // our VR model held instead of original, or NULL
+qboolean VR_IsVRWeaponModel( const model_t *mod );  // one of ours (models/vr/), needs none of the fixes for Half-Life's
 
 #define VR_LOAD_PROC( name ) VR_LoadProc( VR_GetInstance( ), #name, (PFN_xrVoidFunction *)&p##name )
 

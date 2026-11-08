@@ -1547,7 +1547,8 @@ static void VR_MeasureMuzzle( void )
 	if( VR_WeaponTip( view->model, tip ))
 	{
 		// model space is forward, left, up; vr_viewmodel_grip is forward, right, up
-		sscanf( vr_viewmodel_grip.string, "%f %f %f", &g[0], &g[1], &g[2] );
+		if( !VR_IsVRWeaponModel( view->model ))
+			sscanf( vr_viewmodel_grip.string, "%f %f %f", &g[0], &g[1], &g[2] );
 		vr.muzzle_local[0] = tip[0] - g[0];
 		vr.muzzle_local[1] = -tip[1] - g[1];
 		vr.muzzle_local[2] = tip[2] - g[2];
@@ -1781,6 +1782,16 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 {
 	int hand;
 
+	// hold our own VR model instead of Half-Life's where there is one;
+	// V_SetupViewModel sets the original again every frame
+	if( vr_handweapon.value && vr.hand_valid[VR_HAND_RIGHT] )
+	{
+		model_t *vrmodel = VR_WeaponModel( clgame.viewent.model );
+
+		if( vrmodel )
+			clgame.viewent.model = vrmodel;
+	}
+
 	VR_MeasureMuzzle( ); // once per weapon model
 
 	for( hand = 0; hand < 2; hand++ )
@@ -1838,7 +1849,9 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 		vec3_t f, r, u;
 		float g[3] = { 0.0f, 0.0f, 0.0f };
 
-		sscanf( vr_viewmodel_grip.string, "%f %f %f", &g[0], &g[1], &g[2] );
+		// our VR models have their origin where the hand grips them
+		if( !VR_IsVRWeaponModel( view->model ))
+			sscanf( vr_viewmodel_grip.string, "%f %f %f", &g[0], &g[1], &g[2] );
 		AngleVectors( vr.hand_angles[VR_HAND_RIGHT], f, r, u );
 
 		VectorCopy( vr.hand_origin[VR_HAND_RIGHT], view->origin );
@@ -2125,6 +2138,10 @@ static int VR_ViewmodelFlags( void )
 	int flags = 0;
 
 	if( !vr_handweapon.value || !vr.hand_valid[VR_HAND_RIGHT] )
+		return 0;
+
+	// our VR models have no arms and no holes
+	if( VR_IsVRWeaponModel( clgame.viewent.model ))
 		return 0;
 
 	if( vr_hidearms.value )
@@ -2908,7 +2925,7 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_hidearms );
 	Cvar_RegisterVariable( &vr_pinweapon );
 	Cvar_RegisterVariable( &vr_twosided );
-	Cvar_RegisterVariable( &vr_patches );
+	VR_WeaponModelsInit( );
 	Cvar_RegisterVariable( &vr_weapon_length );
 	Cvar_RegisterVariable( &vr_loadfade );
 	Cvar_RegisterVariable( &vr_debug_unfocused );
