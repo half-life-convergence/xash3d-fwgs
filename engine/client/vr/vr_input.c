@@ -39,6 +39,8 @@ static PFN_xrDestroySpace                      pxrDestroySpace;
 static CVAR_DEFINE_AUTO( vr_turnmode, "0", FCVAR_ARCHIVE, "right stick turning: 0 = snap (comfortable), 1 = smooth" );
 static CVAR_DEFINE_AUTO( vr_snapturn, "45", FCVAR_ARCHIVE, "degrees per snap turn" );
 static CVAR_DEFINE_AUTO( vr_turnspeed, "120", FCVAR_ARCHIVE, "smooth turning speed, degrees per second" );
+static CVAR_DEFINE_AUTO( vr_movespeed, "4", FCVAR_ARCHIVE, "stick movement speed at full tilt in metres per second (the original game runs at ~8); 0 = the original full speed" );
+static CVAR_DEFINE_AUTO( vr_movedir, "0", FCVAR_ARCHIVE, "the move stick goes where: 0 = the head looks, 1 = the left hand points" );
 static CVAR_DEFINE_AUTO( vr_debug_sticks, "0 0 0 0", 0, "developer: pretend the sticks are at \"left_x left_y right_x right_y\", to test without controllers" );
 static CVAR_DEFINE_AUTO( vr_debug_hands, "0", 0, "developer: \"1 [yaw pitch]\" fakes both hands held in front of the head (45 cm forward, 20 cm down), the right one turned by yaw/pitch degrees, to test without controllers" );
 
@@ -249,6 +251,8 @@ qboolean VR_InitInput( void )
 	Cvar_RegisterVariable( &vr_turnmode );
 	Cvar_RegisterVariable( &vr_snapturn );
 	Cvar_RegisterVariable( &vr_turnspeed );
+	Cvar_RegisterVariable( &vr_movespeed );
+	Cvar_RegisterVariable( &vr_movedir );
 	Cvar_RegisterVariable( &vr_debug_sticks );
 	Cvar_RegisterVariable( &vr_debug_hands );
 	Cvar_RegisterVariable( &vr_aim_active );
@@ -538,9 +542,12 @@ void VR_PreCreateMove( float frametime )
 VR_CreateMove
 
 After the client built the command from the keyboard: add the held
-buttons and the move stick. The stick moves where the head faces: the
-head's yaw in the play space is folded in, so "forward" is wherever the
-player looks, whichever way the game body points.
+buttons and the move stick. The stick moves where the head faces, or
+with vr_movedir 1 where the left hand points: that yaw in the play space
+is folded in, so "forward" is wherever the player looks (or points),
+whichever way the game body points. Full tilt is vr_movespeed metres per
+second; starts and stops stay as instant as in the original, since slow
+ramps are worse for comfort than sudden ones.
 */
 static void VR_SetAimCvar( convar_t *var, float value )
 {
@@ -594,7 +601,7 @@ static void VR_AimFromHand( usercmd_t *cmd )
 
 void VR_CreateMove( usercmd_t *cmd )
 {
-	float mx, my, h, dx, dy, fwd, side;
+	float mx, my, h, dx, dy, fwd, side, yaw;
 
 	if( !vri.initialized || !VR_Active( ))
 		return;
@@ -607,14 +614,25 @@ void VR_CreateMove( usercmd_t *cmd )
 	{
 		// head forward = (cos h, sin h), head right = (sin h, -cos h) in the
 		// play space, which is the player's frame (X forward, Y left)
-		h = DEG2RAD( VR_HeadYaw( ));
+		if( !vr_movedir.value || !VR_HandYaw( VR_HAND_LEFT, &yaw ))
+			yaw = VR_HeadYaw( ); // and when the left hand isn't tracked
+		h = DEG2RAD( yaw );
 		dx = my * cosf( h ) + mx * sinf( h );
 		dy = my * sinf( h ) - mx * cosf( h );
 
-		fwd = Cvar_VariableValue( "cl_forwardspeed" );
-		side = Cvar_VariableValue( "cl_sidespeed" );
-		if( fwd <= 0.0f ) fwd = 400.0f;
-		if( side <= 0.0f ) side = 400.0f;
+		if( vr_movespeed.value > 0.0f )
+		{
+			// player movement caps the speed at sv_maxspeed (320), so anything
+			// below that comes out exactly; the keyboard keeps its own speeds
+			fwd = side = vr_movespeed.value * Q_max( 1.0f, Cvar_VariableValue( "vr_worldscale" ));
+		}
+		else
+		{
+			fwd = Cvar_VariableValue( "cl_forwardspeed" );
+			side = Cvar_VariableValue( "cl_sidespeed" );
+			if( fwd <= 0.0f ) fwd = 400.0f;
+			if( side <= 0.0f ) side = 400.0f;
+		}
 
 		cmd->forwardmove += dx * fwd;
 		cmd->sidemove += -dy * side; // sidemove is positive to the right

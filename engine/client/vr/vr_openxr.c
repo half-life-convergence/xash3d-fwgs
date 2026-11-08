@@ -190,6 +190,7 @@ static struct
 	// controller itself is at hand_tracked (see VR_CollideHand)
 	qboolean hand_valid[2];
 	vec3_t   hand_tracked[2];
+	float    hand_play_yaw[2]; // where the aim points in the play space, degrees, for vr_movedir
 	qboolean hand_prev_valid[2]; // hand_origin holds last frame's drawn hand
 	qboolean hand_separated[2]; // held back by a wall, easing back to the tracked hand
 	qboolean hand_blocked[2]; // touching a wall this frame
@@ -1681,6 +1682,7 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 
 		VR_EyeView( rvp, &grip, head, vr.hand_tracked[hand], dummy );
 		VR_EyeView( rvp, &aim, head, dummy, vr.hand_angles[hand] );
+		vr.hand_play_yaw[hand] = vr.hand_angles[hand][YAW] - rvp->viewangles[YAW];
 		vr.hand_valid[hand] = true;
 
 		VR_CollideHand( hand, hand == VR_HAND_RIGHT && vr_handweapon.value && clgame.viewent.model );
@@ -2628,6 +2630,8 @@ static void VR_Info_f( void )
 	Con_Printf( "VR: room scale %s, player at %.1f %.1f %.1f yaw %.0f, head %.1f units away, wall fade %.2f\n",
 		vr_roomscale.value ? "on" : "off", cl.simorg[0], cl.simorg[1], cl.simorg[2], cl.viewangles[YAW],
 		sqrtf( vr.room_gap[0] * vr.room_gap[0] + vr.room_gap[1] * vr.room_gap[1] ), vr.fade );
+	Con_Printf( "VR: moving at %.0f units/s (%.1f m/s) horizontally\n", sqrtf( cl.simvel[0] * cl.simvel[0] + cl.simvel[1] * cl.simvel[1] ),
+		sqrtf( cl.simvel[0] * cl.simvel[0] + cl.simvel[1] * cl.simvel[1] ) / Q_max( 1.0f, vr_worldscale.value ));
 
 	{
 		int hand;
@@ -2675,6 +2679,15 @@ qboolean VR_SessionFocused( void )
 float VR_HeadYaw( void )
 {
 	return vr.head_yaw;
+}
+
+qboolean VR_HandYaw( int hand, float *yaw )
+{
+	if( !vr.running || hand < 0 || hand > 1 || !vr.hand_valid[hand] )
+		return false;
+
+	*yaw = vr.hand_play_yaw[hand];
+	return true;
 }
 
 void VR_ListenerView( struct ref_viewpass_s *rvp )
