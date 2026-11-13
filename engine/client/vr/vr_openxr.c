@@ -1207,7 +1207,7 @@ player can't look through walls by leaning or walking into them.
 static void VR_UpdateFade( const vec3_t head_world )
 {
 	vec3_t start, dir;
-	pmtrace_t *tr;
+	pmtrace_t tr;
 	float len, depth;
 
 	vr.fade = 0.0f;
@@ -1223,11 +1223,14 @@ static void VR_UpdateFade( const vec3_t head_world )
 	if( len < 1.0f )
 		return;
 
-	tr = PM_CL_TraceLine( start, (float *)head_world, PM_STUDIO_IGNORE, 2, -1 ); // point hull
-	if( tr->fraction >= 1.0f && !tr->allsolid )
+	// solid geometry only (point hull, studio models skipped); not
+	// PM_CL_TraceLine, whose third argument is a mode, so PM_STUDIO_IGNORE
+	// there would trace every visible entity
+	tr = CL_TraceLine( start, (float *)head_world, PM_STUDIO_IGNORE );
+	if( tr.fraction >= 1.0f && !tr.allsolid )
 		return;
 
-	depth = tr->allsolid ? len : ( 1.0f - tr->fraction ) * len;
+	depth = tr.allsolid ? len : ( 1.0f - tr.fraction ) * len;
 	vr.fade = bound( 0.0f, depth / 6.0f, 1.0f ); // black after 6 units (~15 cm) into the wall
 }
 
