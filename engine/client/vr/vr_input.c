@@ -68,7 +68,6 @@ typedef enum
 	VR_ACT_USE,
 	VR_ACT_RELOAD,
 	VR_ACT_MENU,
-	VR_ACT_FLASHLIGHT, // a button that toggles the flashlight (impulse 100), besides the switch at the temple
 	VR_ACT_FINGER_TRIGGER, // float, per hand: how far the trigger is pulled, for the hand model
 	VR_ACT_FINGER_SQUEEZE, // float, per hand: how hard the grip is squeezed, for the hand model
 	VR_ACT_GRIP_POSE, // pose, per hand: where the hand holds things
@@ -95,7 +94,6 @@ static const vr_action_def_t vr_action_defs[VR_ACT_COUNT] =
 	{ "use", "Use", XR_ACTION_TYPE_BOOLEAN_INPUT, IN_USE },
 	{ "reload", "Reload", XR_ACTION_TYPE_BOOLEAN_INPUT, IN_RELOAD },
 	{ "menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT, 0 },
-	{ "flashlight", "Flashlight", XR_ACTION_TYPE_BOOLEAN_INPUT, 0 },
 	{ "finger_trigger", "Index finger (hand pose)", XR_ACTION_TYPE_FLOAT_INPUT, 0 },
 	{ "finger_squeeze", "Hand closing (hand pose)", XR_ACTION_TYPE_FLOAT_INPUT, 0 },
 	{ "hand_grip", "Hand grip pose", XR_ACTION_TYPE_POSE_INPUT, 0 },
@@ -136,7 +134,6 @@ static const vr_binding_t vr_bindings_index[] =
 	{ VR_ACT_USE, "/user/hand/left/input/a/click" },
 	{ VR_ACT_CROUCH, "/user/hand/left/input/b/click" },
 	{ VR_ACT_MENU, "/user/hand/left/input/thumbstick/click" },
-	{ VR_ACT_FLASHLIGHT, "/user/hand/left/input/trackpad/force" }, // pressing the trackpad, the runtime turns the force into a click
 };
 
 static const vr_binding_t vr_bindings_touch[] =
@@ -152,7 +149,6 @@ static const vr_binding_t vr_bindings_touch[] =
 	{ VR_ACT_USE, "/user/hand/left/input/x/click" },
 	{ VR_ACT_CROUCH, "/user/hand/left/input/y/click" },
 	{ VR_ACT_MENU, "/user/hand/left/input/menu/click" },
-	{ VR_ACT_FLASHLIGHT, "/user/hand/left/input/thumbstick/click" },
 };
 
 static const vr_binding_t vr_bindings_simple[] =
@@ -186,16 +182,13 @@ static struct
 	// this frame's state, read by VR_PreCreateMove
 	int          buttons; // IN_ bits held
 	qboolean     menu;
-	qboolean     flashlight;
 	XrVector2f   move;
 	XrVector2f   turn;
 	float        fingers[2][2]; // [left, right][trigger, squeeze], 0 to 1
 
 	// edge tracking
 	qboolean     menu_was_down;
-	qboolean     flashlight_was_down;
-	qboolean     flashlight_debug_press; // vr_debug_flashlightpress
-	qboolean     flashlight_pending; // pressed, VR_CreateMove sends impulse 100
+	qboolean     flashlight_pending; // switched at the temple, VR_CreateMove sends impulse 100
 	qboolean     headlamp_pull; // the left trigger was pulled at the head flashlight's switch and is still held
 	qboolean     snap_armed; // the turn stick went back to center since the last snap
 	qboolean     flick_armed; // same for weapon flicks
@@ -210,11 +203,6 @@ static struct
 static void VR_DebugCrouchPress_f( void )
 {
 	vri.crouch_debug_press = true;
-}
-
-static void VR_DebugFlashlightPress_f( void )
-{
-	vri.flashlight_debug_press = true;
 }
 
 static qboolean VR_LoadInputProcs( void )
@@ -296,7 +284,6 @@ qboolean VR_InitInput( void )
 	Cvar_RegisterVariable( &vr_crouchtoggle );
 	Cvar_RegisterVariable( &vr_autocrouch );
 	Cmd_AddCommand( "vr_debug_crouchpress", VR_DebugCrouchPress_f, "developer: press the crouch button once, to test without controllers" );
-	Cmd_AddCommand( "vr_debug_flashlightpress", VR_DebugFlashlightPress_f, "developer: press the flashlight button once, to test without controllers" );
 	Cvar_RegisterVariable( &vr_debug_sticks );
 	Cvar_RegisterVariable( &vr_debug_hands );
 	Cvar_RegisterVariable( &vr_debug_fingers );
@@ -526,7 +513,6 @@ static void VR_ReadActions( void )
 
 	vri.buttons = 0;
 	vri.menu = false;
-	vri.flashlight = false;
 	vri.move.x = vri.move.y = vri.turn.x = vri.turn.y = 0.0f;
 	memset( vri.fingers, 0, sizeof( vri.fingers ));
 
@@ -547,7 +533,6 @@ static void VR_ReadActions( void )
 			}
 
 			vri.menu = VR_Bool( VR_ACT_MENU );
-			vri.flashlight = VR_Bool( VR_ACT_FLASHLIGHT );
 			vri.move = VR_Vector( VR_ACT_MOVE );
 			vri.turn = VR_Vector( VR_ACT_TURN );
 
@@ -600,20 +585,10 @@ void VR_PreCreateMove( float frametime )
 		Cbuf_AddText( "togglemenu\n" );
 	vri.menu_was_down = vri.menu;
 
-	// the flashlight toggles on press, in the game only; VR_CreateMove puts
-	// impulse 100 in this frame's command, and the game does the rest
-	// (sound, battery, the light), as with the keyboard
-	if( vri.flashlight_debug_press )
-	{
-		vri.flashlight = true;
-		vri.flashlight_debug_press = false;
-	}
-	if( vri.flashlight && !vri.flashlight_was_down && cls.key_dest == key_game )
-		vri.flashlight_pending = true;
-	vri.flashlight_was_down = vri.flashlight;
-
-	// the flashlight is on the head and also switches like a headlamp: the
-	// left trigger pulled beside the left temple
+	// the flashlight is on the head and switches like a headlamp: the left
+	// trigger pulled beside the left temple, in the game only. VR_CreateMove
+	// puts impulse 100 in the command, and the game does the rest (sound,
+	// battery, the light), as with the keyboard.
 	{
 		qboolean at_lamp = VR_HeadlampZone( );
 		float trigger, squeeze;
@@ -802,7 +777,7 @@ void VR_CreateMove( usercmd_t *cmd )
 
 	cmd->buttons |= VR_CrouchButtons( cmd->buttons );
 
-	// the flashlight button, unless the command already carries an impulse
+	// the flashlight switch, unless the command already carries an impulse
 	// (it waits for the next one then)
 	if( vri.flashlight_pending && !cmd->impulse )
 	{
