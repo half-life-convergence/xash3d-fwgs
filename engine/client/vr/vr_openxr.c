@@ -208,6 +208,15 @@ static struct
 	vec3_t   hand_origin[2];
 	vec3_t   hand_angles[2];
 
+	// the off hand against the weapon in the right hand, see VR_OffhandWeapon
+	int      hand_pose[2]; // hands.mdl pose for VR_AddHands, -1 = from the fingers
+	const model_t *grab_model; // the weapon model grab_point belongs to
+	int      grab_point; // the grab point the left hand holds, -1 = none
+	int      grab_near; // the grab point the left hand is reaching for, -1 = none
+	qboolean offhand_on_gun; // the left hand was pushed out of the weapon this frame
+	qboolean offhand_prev_valid;
+	vec3_t   offhand_prev; // last frame's drawn left hand in the gun's axes
+
 	// the head center in the world, this frame, for the sound listener
 	vec3_t   head_origin;
 	vec3_t   head_angles;
@@ -254,6 +263,9 @@ static CVAR_DEFINE_AUTO( vr_pinweapon, "1", FCVAR_ARCHIVE, "keep the weapon stil
 static CVAR_DEFINE_AUTO( vr_twosided, "1", FCVAR_ARCHIVE, "draw the weapon in the hand without back-face culling, so faces Half-Life left out of the model show the far side instead of a hole" );
 static int VR_ViewmodelFlags( void );
 static CVAR_DEFINE_AUTO( vr_handcollide, "1", FCVAR_ARCHIVE, "hands and the weapon stop at walls instead of going through them" );
+static CVAR_DEFINE_AUTO( vr_weaponcollide, "1", FCVAR_ARCHIVE, "the off hand touches the weapon in the other hand instead of going through it (our VR weapon models)" );
+static CVAR_DEFINE_AUTO( vr_grab_needgrip, "1", FCVAR_ARCHIVE, "the off hand takes hold of a weapon's grab point only while squeezing grip; 0 = as soon as it's close" );
+static CVAR_DEFINE_AUTO( vr_debug_offhand, "", 0, "developer: with vr_debug_hands, put the left hand at \"forward right up\" game units from the right hand, in the gun's axes" );
 static CVAR_DEFINE_AUTO( vr_weapon_length, "12", FCVAR_ARCHIVE, "for weapon models without a muzzle point that aren't in the built-in table: how far they reach past the hand along the aim, game units" );
 static CVAR_DEFINE_AUTO( vr_loadfade, "0.5", FCVAR_ARCHIVE, "seconds the view takes to fade in after loading, 0 = no fade" );
 static CVAR_DEFINE_AUTO( vr_debug_unfocused, "0", 0, "developer: act as if the headset lost focus (headset off, system menu open), to test pausing without a headset" );
@@ -273,6 +285,10 @@ static CVAR_DEFINE_AUTO( vr_debug_unfocused, "0", 0, "developer: act as if the h
 #define VR_HAND_RADIUS 1.5f // game units (~4 cm) kept between a hand and a surface
 #define VR_HAND_RESET 12.0f // drawn and tracked hand further apart (~30 cm): start over from the eyes
 #define VR_HAND_EASE 20.0f // how fast a freed hand catches up, 1/s
+#define VR_OFFHAND_RADIUS 1.5f // game units (~4 cm): the off hand's palm against the weapon
+#define VR_GRAB_BREAK 6.0f // game units (~15 cm) past the snap radius: the controller pulls the hand off a grab point
+#define VR_GRAB_HOLD 0.6f // grip squeezed this far takes hold of a grab point
+#define VR_GRAB_LET_GO 0.4f // ... and below this lets go
 #define VR_BARREL_MARGIN 2.0f // kept between the muzzle and a wall
 #define VR_HEAD_RADIUS_GUN 7.0f // the weapon stays this far from the head center (~18 cm, room for the barrel's thickness)
 #define VR_HEAD_RADIUS_HAND 4.0f // an empty hand (~10 cm)
@@ -1454,36 +1470,11 @@ static qboolean VR_WeaponTip( model_t *model, vec3_t tip )
 	studiohdr_t *hdr = Mod_StudioExtradata( model );
 	static matrix3x4 bones[VR_MAX_TIP_BONES];
 	mstudiobodyparts_t *parts;
-	mstudioseqdesc_t *seq;
-	mstudiobone_t *pbones;
-	mstudioanim_t *panim;
 	qboolean found = false;
 	int i, j;
 
-	if( !hdr || hdr->numbones <= 0 || hdr->numbones > VR_MAX_TIP_BONES || hdr->numseq <= 0 )
+	if( !VR_IdleBones( hdr, bones, VR_MAX_TIP_BONES ))
 		return false;
-
-	seq = (mstudioseqdesc_t *)((byte *)hdr + hdr->seqindex);
-	if( seq->seqgroup != 0 )
-		return false; // animation in a separate file
-
-	pbones = (mstudiobone_t *)((byte *)hdr + hdr->boneindex);
-	panim = (mstudioanim_t *)((byte *)hdr + seq->animindex);
-
-	// bones come parents first
-	for( i = 0; i < hdr->numbones; i++ )
-	{
-		matrix3x4 local;
-		vec3_t pos;
-		vec4_t q;
-
-		R_StudioCalcBones( 0, 0.0f, &pbones[i], &panim[i], NULL, pos, q );
-		Matrix3x4_FromOriginQuat( local, q, pos );
-
-		if( pbones[i].parent < 0 || pbones[i].parent >= i )
-			Matrix3x4_Copy( bones[i], local );
-		else Matrix3x4_ConcatTransforms( bones[i], bones[pbones[i].parent], local );
-	}
 
 	parts = (mstudiobodyparts_t *)((byte *)hdr + hdr->bodypartindex);
 	for( i = 0; i < hdr->numbodyparts; i++ )
@@ -1770,6 +1761,224 @@ static void VR_CollideHand( int hand, qboolean weapon )
 	vr.hand_prev_valid[hand] = true;
 }
 
+// a hand-axes vector (forward, right, up) into world axes and back
+static void VR_GunToWorld( const vec3_t f, const vec3_t r, const vec3_t u, const vec3_t in, vec3_t out )
+{
+	VectorScale( f, in[0], out );
+	VectorMA( out, in[1], r, out );
+	VectorMA( out, in[2], u, out );
+}
+
+static void VR_WorldToGun( const vec3_t f, const vec3_t r, const vec3_t u, const vec3_t in, vec3_t out )
+{
+	vec3_t t;
+
+	VectorSet( t, DotProduct( in, f ), DotProduct( in, r ), DotProduct( in, u ));
+	VectorCopy( t, out );
+}
+
+/*
+VR_PushOutOfBox
+
+Keeps a sphere of VR_OFFHAND_RADIUS at pos (gun axes) out of one box.
+With the center outside the box it moves straight away from the nearest
+point; with the center inside, it leaves through the face prev (last
+frame's position) was beyond, so a hand pushed through a thin part
+doesn't pop out the far side. Returns true if it moved pos.
+*/
+static qboolean VR_PushOutOfBox( const vr_weapon_box_t *box, vec3_t pos, const vec3_t prev, qboolean prev_valid )
+{
+	vec3_t d, p, q, pp;
+	float dist, best = -1e9f;
+	int j, axis = 0;
+	qboolean inside = true;
+
+	VectorSubtract( pos, box->center, d );
+	for( j = 0; j < 3; j++ )
+	{
+		p[j] = DotProduct( d, box->axis[j] );
+		q[j] = bound( -box->half[j], p[j], box->half[j] );
+		if( q[j] != p[j] )
+			inside = false;
+	}
+
+	if( !inside )
+	{
+		VectorSubtract( p, q, d );
+		dist = VectorLength( d );
+		if( dist >= VR_OFFHAND_RADIUS )
+			return false;
+		VectorMA( q, VR_OFFHAND_RADIUS / dist, d, p );
+	}
+	else
+	{
+		// the face the hand came through, or the nearest one
+		if( prev_valid )
+		{
+			VectorSubtract( prev, box->center, d );
+			for( j = 0; j < 3; j++ )
+				pp[j] = DotProduct( d, box->axis[j] );
+		}
+		else VectorCopy( p, pp );
+
+		for( j = 0; j < 3; j++ )
+		{
+			float out = fabsf( pp[j] ) - box->half[j];
+
+			if( out > best )
+			{
+				best = out;
+				axis = j;
+			}
+		}
+
+		p[axis] = ( pp[axis] < 0.0f ? -1.0f : 1.0f ) * ( box->half[axis] + VR_OFFHAND_RADIUS );
+	}
+
+	VectorCopy( box->center, pos );
+	for( j = 0; j < 3; j++ )
+		VectorMA( pos, p[j], box->axis[j], pos );
+	return true;
+}
+
+/*
+VR_OffhandWeapon
+
+After both hands are placed: the left hand and the weapon in the right
+hand, for our VR weapon models (VR_WeaponShape; Half-Life's own models
+include their arms, so they're left alone).
+
+- On a grab point: the left hand sits on it, turned and posed as the
+  grab point says, and moves with the gun. It takes hold when the
+  controller comes within the grab point's radius while grip is squeezed
+  (or right away with vr_grab_needgrip 0), and lets go when grip is
+  released or the controller is pulled VR_GRAB_BREAK further away.
+- Reaching for a grab point (the controller within its radius): no
+  collision, so the hand can get there.
+- Otherwise the palm is kept out of the gun's boxes (VR_PushOutOfBox),
+  with walls winning over the gun.
+
+Moving the drawn hand marks it separated, so VR_CollideHand eases it back
+to the controller next frame instead of snapping.
+*/
+static void VR_OffhandWeapon( void )
+{
+	const int off = VR_HAND_LEFT, gun = VR_HAND_RIGHT;
+	const model_t *model = clgame.viewent.model;
+	const vr_weapon_shape_t *shape;
+	vec3_t f, r, u, rel, tracked, pos, world, normal;
+	float trigger, squeeze, best;
+	qboolean moved = false;
+	int i, iter;
+
+	vr.hand_pose[off] = vr.hand_pose[gun] = -1;
+	vr.grab_near = -1;
+	vr.offhand_on_gun = false;
+
+	if( !vr_weaponcollide.value || !vr_handweapon.value || !vr.hand_valid[off] || !vr.hand_valid[gun]
+		|| !Cvar_VariableValue( "r_drawviewmodel" ) || !( shape = VR_WeaponShape( model )))
+	{
+		vr.grab_point = -1;
+		vr.grab_model = NULL;
+		vr.offhand_prev_valid = false;
+		return;
+	}
+
+	if( model != vr.grab_model )
+	{
+		vr.grab_model = model;
+		vr.grab_point = -1;
+		vr.offhand_prev_valid = false;
+	}
+
+	AngleVectors( vr.hand_angles[gun], f, r, u );
+	VectorSubtract( vr.hand_tracked[off], vr.hand_origin[gun], rel );
+	VR_WorldToGun( f, r, u, rel, tracked );
+	VR_HandFingers( off, &trigger, &squeeze );
+
+	// let go?
+	if( vr.grab_point >= 0 )
+	{
+		const vr_grab_point_t *g = &shape->grabs[vr.grab_point];
+
+		if( VectorDistance( tracked, g->origin ) > g->radius + VR_GRAB_BREAK
+			|| ( vr_grab_needgrip.value && squeeze < VR_GRAB_LET_GO ))
+			vr.grab_point = -1;
+	}
+
+	// the nearest grab point in reach
+	best = 1e9f;
+	for( i = 0; i < shape->num_grabs; i++ )
+	{
+		float d = VectorDistance( tracked, shape->grabs[i].origin );
+
+		if( d < shape->grabs[i].radius && d < best )
+		{
+			best = d;
+			vr.grab_near = i;
+		}
+	}
+
+	if( vr.grab_point < 0 && vr.grab_near >= 0 && ( !vr_grab_needgrip.value || squeeze >= VR_GRAB_HOLD ))
+		vr.grab_point = vr.grab_near;
+
+	if( vr.grab_point >= 0 )
+	{
+		const vr_grab_point_t *g = &shape->grabs[vr.grab_point];
+		vec3_t lf, lr, lu, wf, wr, wu;
+
+		VR_GunToWorld( f, r, u, g->origin, world );
+		VectorAdd( vr.hand_origin[gun], world, vr.hand_origin[off] );
+
+		// the grab point's angles are relative to the gun
+		AngleVectors( g->angles, lf, lr, lu );
+		VR_GunToWorld( f, r, u, lf, wf );
+		VR_GunToWorld( f, r, u, lr, wr );
+		VR_GunToWorld( f, r, u, lu, wu );
+		VectorsAngles( wf, wr, wu, vr.hand_angles[off] );
+
+		vr.hand_pose[off] = g->seq;
+		vr.hand_separated[off] = true;
+		VectorCopy( g->origin, vr.offhand_prev );
+		vr.offhand_prev_valid = true;
+		return;
+	}
+
+	VectorSubtract( vr.hand_origin[off], vr.hand_origin[gun], rel );
+	VR_WorldToGun( f, r, u, rel, pos );
+
+	if( vr.grab_near < 0 )
+	{
+		// twice, for a hand between two boxes
+		for( iter = 0; iter < 2; iter++ )
+		{
+			for( i = 0; i < shape->num_boxes; i++ )
+			{
+				if( VR_PushOutOfBox( &shape->boxes[i], pos, vr.offhand_prev, vr.offhand_prev_valid ))
+					moved = true;
+			}
+		}
+	}
+
+	if( moved )
+	{
+		// walls win: from where the wall check left the hand to the pushed place
+		VR_GunToWorld( f, r, u, pos, world );
+		VectorAdd( vr.hand_origin[gun], world, world );
+		VR_HandTrace( vr.hand_origin[off], world, normal );
+		VectorCopy( world, vr.hand_origin[off] );
+
+		vr.hand_separated[off] = true;
+		vr.offhand_on_gun = true;
+
+		VectorSubtract( vr.hand_origin[off], vr.hand_origin[gun], rel );
+		VR_WorldToGun( f, r, u, rel, pos );
+	}
+
+	VectorCopy( pos, vr.offhand_prev );
+	vr.offhand_prev_valid = true;
+}
+
 /*
 VR_UpdateHands
 
@@ -1799,11 +2008,14 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 
 	VR_MeasureMuzzle( ); // once per weapon model
 
-	for( hand = 0; hand < 2; hand++ )
+	// the right hand first, so vr_debug_offhand can place the left one from it
+	for( int n = 0; n < 2; n++ )
 	{
 		XrPosef grip, aim;
 		vec3_t dummy;
 		float dyaw, dpitch;
+
+		hand = n ? VR_HAND_LEFT : VR_HAND_RIGHT;
 
 		if( VR_DebugHands( &dyaw, &dpitch ))
 		{
@@ -1845,8 +2057,20 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 		vr.hand_play_yaw[hand] = vr.hand_angles[hand][YAW] - rvp->viewangles[YAW];
 		vr.hand_valid[hand] = true;
 
+		if( hand == VR_HAND_LEFT && vr.hand_valid[VR_HAND_RIGHT] && VR_DebugHands( NULL, NULL ) && vr_debug_offhand.string[0] )
+		{
+			vec3_t o = { 0.0f, 0.0f, 0.0f }, f, r, u, ofs;
+
+			sscanf( vr_debug_offhand.string, "%f %f %f", &o[0], &o[1], &o[2] );
+			AngleVectors( vr.hand_angles[VR_HAND_RIGHT], f, r, u );
+			VR_GunToWorld( f, r, u, o, ofs );
+			VectorAdd( vr.hand_tracked[VR_HAND_RIGHT], ofs, vr.hand_tracked[hand] );
+		}
+
 		VR_CollideHand( hand, hand == VR_HAND_RIGHT && vr_handweapon.value && clgame.viewent.model );
 	}
+
+	VR_OffhandWeapon( );
 
 	if( vr_handweapon.value && vr.hand_valid[VR_HAND_RIGHT] )
 	{
@@ -1881,7 +2105,7 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 	// the hands go where the tracked hands are; the right one grips the weapon
 	if( !vr_handweapon.value || !vr.hand_valid[VR_HAND_RIGHT] || !Cvar_VariableValue( "r_drawviewmodel" ))
 		held = NULL;
-	VR_AddHands( vr.hand_valid, (const vec3_t *)vr.hand_origin, (const vec3_t *)vr.hand_angles, held );
+	VR_AddHands( vr.hand_valid, (const vec3_t *)vr.hand_origin, (const vec3_t *)vr.hand_angles, held, vr.hand_pose );
 }
 
 /*
@@ -2863,6 +3087,27 @@ static void VR_Info_f( void )
 			cl.cmd.viewangles[PITCH], cl.cmd.viewangles[YAW], cl.viewangles[YAW],
 			Cvar_VariableValue( "vr_aim_active" ) ? "at the hand," : "at the eyes,",
 			Cvar_VariableValue( "vr_aim_x" ), Cvar_VariableValue( "vr_aim_y" ), Cvar_VariableValue( "vr_aim_z" ));
+		if( vr.grab_model )
+		{
+			const vr_weapon_shape_t *shape = VR_WeaponShape( vr.grab_model );
+			vec3_t f, r, u, rel, c, d;
+
+			// both hands in the gun's axes (forward, right, up from the grip)
+			AngleVectors( vr.hand_angles[VR_HAND_RIGHT], f, r, u );
+			VectorSubtract( vr.hand_tracked[VR_HAND_LEFT], vr.hand_origin[VR_HAND_RIGHT], rel );
+			VR_WorldToGun( f, r, u, rel, c );
+			VectorSubtract( vr.hand_origin[VR_HAND_LEFT], vr.hand_origin[VR_HAND_RIGHT], rel );
+			VR_WorldToGun( f, r, u, rel, d );
+			Con_Printf( "VR: from the gun's grip, the left controller is at %.1f %.1f %.1f and the left hand drawn at %.1f %.1f %.1f (forward right up)\n",
+				c[0], c[1], c[2], d[0], d[1], d[2] );
+
+			if( shape && vr.grab_point >= 0 && vr.grab_point < shape->num_grabs )
+				Con_Printf( "VR: left hand holds grab point \"%s\" of %s\n", shape->grabs[vr.grab_point].name, vr.grab_model->name );
+			else if( shape && vr.grab_near >= 0 && vr.grab_near < shape->num_grabs )
+				Con_Printf( "VR: left hand reaching for grab point \"%s\" of %s\n", shape->grabs[vr.grab_near].name, vr.grab_model->name );
+			else Con_Printf( "VR: left hand %s %s (%d boxes)\n", vr.offhand_on_gun ? "against" : "clear of",
+				vr.grab_model->name, shape ? shape->num_boxes : 0 );
+		}
 		VR_HandsInfo( );
 	}
 }
@@ -2933,6 +3178,9 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_crouchheight );
 	Cvar_RegisterVariable( &vr_stairsmooth );
 	Cvar_RegisterVariable( &vr_handcollide );
+	Cvar_RegisterVariable( &vr_weaponcollide );
+	Cvar_RegisterVariable( &vr_grab_needgrip );
+	Cvar_RegisterVariable( &vr_debug_offhand );
 	Cvar_RegisterVariable( &vr_hidearms );
 	Cvar_RegisterVariable( &vr_pinweapon );
 	Cvar_RegisterVariable( &vr_twosided );

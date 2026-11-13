@@ -33,7 +33,10 @@ GNU General Public License for more details.
 // - animations found by name: "grip_<weapon>" while the right hand holds that
 //   weapon (grip_9mmAR for v_9mmAR.mdl), else "grip_default"; an empty hand
 //   plays "hand". In all of them blend 0 follows the trigger (index finger);
-//   in "hand" the frame follows the grip (open to fist).
+//   in "hand" the frame follows the grip (open to fist);
+// - the left hand on one of a weapon's grab points plays that grab point's
+//   animation (see vr_weaponmodels.c), a still pose with blend 0 following
+//   the trigger like the grips; "grab_default" when the model hasn't got it.
 //
 // The model is loaded with the map (VR_LoadHandModel), never while drawing.
 static CVAR_DEFINE_AUTO( vr_hands, "1", FCVAR_ARCHIVE, "draw the player's hands (models/vr/hands.mdl)" );
@@ -80,6 +83,15 @@ static int VR_FindSequence( const studiohdr_t *hdr, const char *name )
 	}
 
 	return -1;
+}
+
+int VR_HandSequence( const char *name )
+{
+	studiohdr_t *hdr;
+
+	if( !vrh.model || !name || !name[0] || !( hdr = Mod_StudioExtradata( vrh.model )))
+		return -1;
+	return VR_FindSequence( hdr, name );
 }
 
 void VR_LoadHandModel( void )
@@ -180,9 +192,10 @@ hands where the tracked hands are and adds them to this frame's scene
 (CL_EmitEntities already built it, R_ClearScene only runs next frame).
 valid/origin/angles are the hands as drawn (origin kept out of walls,
 angles in view convention); held is Half-Life's weapon model in the right
-hand, or NULL.
+hand, or NULL. pose is -1 for a hand posed by its fingers, else the
+animation of the weapon grab point it holds (VR_POSE_FIST: a closed hand).
 */
-void VR_AddHands( const qboolean valid[2], const vec3_t origin[2], const vec3_t angles[2], const model_t *held )
+void VR_AddHands( const qboolean valid[2], const vec3_t origin[2], const vec3_t angles[2], const model_t *held, const int pose[2] )
 {
 	const qboolean suit = VR_HasSuit( );
 
@@ -202,12 +215,22 @@ void VR_AddHands( const qboolean valid[2], const vec3_t origin[2], const vec3_t 
 
 		VR_HandFingers( hand, &trigger, &squeeze );
 
-		if( hand == VR_HAND_RIGHT && held )
+		if( pose[hand] >= 0 )
+		{
+			seq = pose[hand];
+			squeeze = 0.0f; // still pose, like the grips
+		}
+		else if( hand == VR_HAND_RIGHT && held )
 		{
 			seq = VR_GripSequence( held );
 			squeeze = 0.0f; // the grip animation already holds the gun
 		}
-		else seq = vrh.seq_hand >= 0 ? vrh.seq_hand : 0;
+		else
+		{
+			seq = vrh.seq_hand >= 0 ? vrh.seq_hand : 0;
+			if( pose[hand] == VR_POSE_FIST )
+				squeeze = 1.0f;
+		}
 
 		memset( ent, 0, sizeof( *ent ));
 		ent->model = vrh.model;
