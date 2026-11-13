@@ -130,7 +130,7 @@ static const vr_binding_t vr_bindings_index[] =
 	{ VR_ACT_MOVE, "/user/hand/left/input/thumbstick" },
 	{ VR_ACT_TURN, "/user/hand/right/input/thumbstick" },
 	{ VR_ACT_FIRE, "/user/hand/right/input/trigger/click" },
-	{ VR_ACT_ALTFIRE, "/user/hand/left/input/trigger/click" },
+	{ VR_ACT_ALTFIRE, "/user/hand/right/input/trackpad/force" }, // pressing the trackpad, the runtime turns the force into a click
 	{ VR_ACT_JUMP, "/user/hand/right/input/a/click" },
 	{ VR_ACT_RELOAD, "/user/hand/right/input/b/click" },
 	{ VR_ACT_USE, "/user/hand/left/input/a/click" },
@@ -146,7 +146,7 @@ static const vr_binding_t vr_bindings_touch[] =
 	{ VR_ACT_MOVE, "/user/hand/left/input/thumbstick" },
 	{ VR_ACT_TURN, "/user/hand/right/input/thumbstick" },
 	{ VR_ACT_FIRE, "/user/hand/right/input/trigger/value" },
-	{ VR_ACT_ALTFIRE, "/user/hand/left/input/trigger/value" },
+	{ VR_ACT_ALTFIRE, "/user/hand/right/input/thumbstick/click" },
 	{ VR_ACT_JUMP, "/user/hand/right/input/a/click" },
 	{ VR_ACT_RELOAD, "/user/hand/right/input/b/click" },
 	{ VR_ACT_USE, "/user/hand/left/input/x/click" },
@@ -613,8 +613,7 @@ void VR_PreCreateMove( float frametime )
 	vri.flashlight_was_down = vri.flashlight;
 
 	// the flashlight is on the head and also switches like a headlamp: the
-	// left trigger pulled beside the left temple. The trigger is alt fire
-	// too, so alt fire waits while the hand is there or that pull is held.
+	// left trigger pulled beside the left temple
 	{
 		qboolean at_lamp = VR_HeadlampZone( );
 		float trigger, squeeze;
@@ -632,9 +631,6 @@ void VR_PreCreateMove( float frametime )
 			if( cls.key_dest == key_game )
 				vri.flashlight_pending = true;
 		}
-
-		if( at_lamp || vri.headlamp_pull )
-			ClearBits( vri.buttons, IN_ATTACK2 );
 	}
 
 	tx = VR_Deadzone( vri.turn.x );
