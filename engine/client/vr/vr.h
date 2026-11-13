@@ -40,6 +40,11 @@ void VR_EndFrame( void );
 // SteamVR doesn't throttle xrWaitFrame for frames without layers.
 qboolean VR_PacesFrames( void );
 
+// called by Host_RunFrame while a changelevel is queued: true holds it
+// back for this frame, so the eyes can fade to black before the engine
+// blocks in the load (vr_levelfade)
+qboolean VR_HoldLevelChange( void );
+
 // called by V_RenderView before the desktop pass: draws the 3D view into
 // both eye swapchains through the renderer (RF_EXTERNAL_TARGET) and says
 // what the desktop pass has to do

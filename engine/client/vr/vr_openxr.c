@@ -242,7 +242,8 @@ static struct
 	double   transition_time; // when the current phase began
 	double   transition_last; // last update, for the fade speed
 	int      hold_frames; // frames rendered since loading ended
-	float    load_fade; // fade-in after loading, 0..1, drawn like the wall fade
+	float    load_fade; // fade to black before and after loading, 0..1, drawn like the wall fade
+	qboolean fadeout_done; // the fade-out before a level change is black, let the load run this frame
 	qboolean game_paused; // the session lost focus, the game is paused
 	uint32_t frames_panel; // frames submitted with the loading panel
 
@@ -281,6 +282,7 @@ static CVAR_DEFINE_AUTO( vr_twohanded, "1", FCVAR_ARCHIVE, "while the off hand h
 static CVAR_DEFINE_AUTO( vr_debug_offhand, "", 0, "developer: with vr_debug_hands, put the left hand at \"forward right up\" game units from the right hand, in the gun's axes" );
 static CVAR_DEFINE_AUTO( vr_weapon_length, "12", FCVAR_ARCHIVE, "for weapon models without a muzzle point that aren't in the built-in table: how far they reach past the hand along the aim, game units" );
 static CVAR_DEFINE_AUTO( vr_loadfade, "0.5", FCVAR_ARCHIVE, "seconds the view takes to fade in after loading, 0 = no fade" );
+static CVAR_DEFINE_AUTO( vr_levelfade, "0.4", FCVAR_ARCHIVE, "seconds the view takes to fade out before a level change (the game keeps running meanwhile), 0 = cut straight to the loading panel" );
 static CVAR_DEFINE_AUTO( vr_debug_unfocused, "0", 0, "developer: act as if the headset lost focus (headset off, system menu open), to test pausing without a headset" );
 
 // stair smoothing, see VR_UpdateStairs
@@ -312,6 +314,7 @@ static CVAR_DEFINE_AUTO( vr_debug_unfocused, "0", 0, "developer: act as if the h
 #define VR_TRANSITION_LOADING 1 // the game is loading, only the panel is submitted
 #define VR_TRANSITION_HOLD    2 // loaded, the panel stays until the first frames run smoothly
 #define VR_TRANSITION_FADEIN  3 // the eyes are back, fading in from black
+#define VR_TRANSITION_FADEOUT 4 // a level change is held back while the eyes fade to black
 
 #define VR_PANEL_WIDTH  1280 // loading panel image, 16:9 like most desktop windows
 #define VR_PANEL_HEIGHT 720
@@ -2619,8 +2622,36 @@ game, a save being loaded, death reloading the last save) until the
 client is back in the game with the loading plaque gone. The engine
 blocks for seconds somewhere in between.
 */
+/*
+VR_FadingOut
+
+True while a level change is queued but held back (VR_HoldLevelChange)
+so the eyes can fade to black first. Until the fade is done the game runs
+on as normal; the frame whose fade is complete is the last one held, it
+draws and submits the loading panel and the load starts right after it.
+Only for changelevels during play: loading a save or starting a new game
+already happens behind the menu or the death fade.
+*/
+static qboolean VR_FadingOut( void )
+{
+	if( GameState->curstate != STATE_RUNFRAME || GameState->nextstate != STATE_CHANGELEVEL )
+		return false;
+	if( vr.transition == VR_TRANSITION_FADEOUT )
+		return !vr.fadeout_done;
+
+	return vr.transition == VR_TRANSITION_NONE && vr.running && vr.submits_layers
+		&& vr_levelfade.value > 0.0f && cls.state == ca_active && !cl.background;
+}
+
+qboolean VR_HoldLevelChange( void )
+{
+	return vr.initialized && VR_FadingOut( );
+}
+
 static qboolean VR_GameLoading( void )
 {
+	if( VR_FadingOut( ))
+		return false; // the load is held back, the eyes are still drawn
 	if( GameState->curstate != STATE_RUNFRAME || GameState->nextstate != STATE_RUNFRAME )
 		return true; // set during the server frame that triggers the load
 	if( cls.disable_screen )
@@ -3081,6 +3112,7 @@ static void VR_SetTransition( int transition, double now )
 	vr.transition = transition;
 	vr.transition_time = now;
 	vr.hold_frames = 0;
+	vr.fadeout_done = false;
 }
 
 /*
@@ -3089,6 +3121,10 @@ VR_UpdateTransition
 Once per submitted frame, decides what the headset gets:
 
 NONE     playing: the eyes.
+FADEOUT  a changelevel is queued and held back (VR_FadingOut): the eyes,
+         fading to black over vr_levelfade (the fade is set in
+         VR_WaitFrame, before the frame is drawn). The frame that reaches
+         black counts as loading, so it already sends the panel.
 LOADING  from the frame that triggers a load until the game is back:
          only the loading panel (or nothing, if it couldn't be drawn).
          The last frame before the engine blocks is a panel frame, so
@@ -3098,8 +3134,8 @@ HOLD     loaded: the eyes are drawn again but the panel stays for a few
          frames, so the hitches of the first frames stay hidden.
 FADEIN   the eyes are submitted, fading in from black over vr_loadfade.
 
-Starting a load cuts straight to the panel: the server has already
-switched levels by then, there's no frame left to fade out in.
+Other loads (a save, a new game, a death reload) and changelevels with
+vr_levelfade 0 cut straight to the panel.
 */
 static void VR_UpdateTransition( void )
 {
@@ -3116,7 +3152,9 @@ static void VR_UpdateTransition( void )
 
 	if( loading && vr.transition != VR_TRANSITION_LOADING )
 	{
-		if( vr.transition == VR_TRANSITION_NONE )
+		if( vr.transition == VR_TRANSITION_FADEOUT )
+			Con_Printf( "VR: faded out in %.2f s\n", now - vr.transition_time );
+		if( vr.transition == VR_TRANSITION_NONE || vr.transition == VR_TRANSITION_FADEOUT )
 			VR_PlacePanel( );
 		Con_Printf( "VR: loading, the headset shows the loading panel\n" );
 		VR_SetTransition( VR_TRANSITION_LOADING, now );
@@ -3126,6 +3164,23 @@ static void VR_UpdateTransition( void )
 
 	switch( vr.transition )
 	{
+	case VR_TRANSITION_NONE:
+		if( VR_FadingOut( ))
+		{
+			Con_Printf( "VR: level change, fading out\n" );
+			VR_SetTransition( VR_TRANSITION_FADEOUT, now );
+			vr.load_fade = 0.0f;
+		}
+		break;
+	case VR_TRANSITION_FADEOUT:
+		// still fading, or the queued level change went away without a
+		// load (disconnect, error): back to playing
+		if( !VR_FadingOut( ))
+		{
+			VR_SetTransition( VR_TRANSITION_NONE, now );
+			vr.load_fade = 0.0f;
+		}
+		break;
 	case VR_TRANSITION_LOADING:
 		if( !loading )
 		{
@@ -3252,6 +3307,18 @@ void VR_WaitFrame( void )
 	// so every xrWaitFrame stays paired with one xrBeginFrame/xrEndFrame
 	VR_SubmitFrame( );
 
+	// the fade before a level change is set once, before anything of this
+	// frame is drawn: the frame that reaches black must count as loading
+	// in the swap hook (panel drawn) and in Host_RunFrame (load let go)
+	if( vr.transition == VR_TRANSITION_FADEOUT && !vr.fadeout_done )
+	{
+		double t = vr_levelfade.value > 0.0f ? ( Platform_DoubleTime() - vr.transition_time ) / vr_levelfade.value : 1.0;
+
+		vr.load_fade = (float)Q_min( t, 1.0 );
+		if( t >= 1.0 )
+			vr.fadeout_done = true;
+	}
+
 	// no frame is open here, the only safe moment to rebuild the eye swapchains
 	VR_CheckEyeTargets( );
 	if( !vr.running )
@@ -3316,8 +3383,9 @@ static void VR_Info_f( void )
 		VR_PrintFrameStats( );
 
 	{
-		static const char *names[] = { "playing", "loading (panel)", "loaded, holding the panel", "fading in" };
-		Con_Printf( "VR: %s, game %s\n", names[bound( 0, vr.transition, 3 )], vr.game_paused ? "paused (no focus)" : "running" );
+		static const char *names[] = { "playing", "loading (panel)", "loaded, holding the panel", "fading in", "fading out before a level change" };
+		Con_Printf( "VR: %s (black %.2f, %.2f s in), game %s\n", names[bound( 0, vr.transition, 4 )], vr.load_fade,
+			Platform_DoubleTime() - vr.transition_time, vr.game_paused ? "paused (no focus)" : "running" );
 	}
 
 	Con_Printf( "VR: room scale %s, player at %.1f %.1f %.1f yaw %.0f, head %.1f units away, wall fade %.2f\n",
@@ -3468,6 +3536,7 @@ void VR_Init( void )
 	VR_HandsInit( );
 	Cvar_RegisterVariable( &vr_weapon_length );
 	Cvar_RegisterVariable( &vr_loadfade );
+	Cvar_RegisterVariable( &vr_levelfade );
 	Cvar_RegisterVariable( &vr_debug_unfocused );
 	Cmd_AddCommand( "vr_recenter", VR_Recenter_f, "put the player back under the real head" );
 	Cmd_AddCommand( "vr_calibrate", VR_Calibrate_f, "stand or sit normally and run it: sets vr_heightoffset so your head is at the game's eye height" );

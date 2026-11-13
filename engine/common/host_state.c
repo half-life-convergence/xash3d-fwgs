@@ -15,6 +15,9 @@ GNU General Public License for more details.
 
 #include "common.h"
 #include "platform/platform.h"
+#if XASH_OPENXR && !XASH_DEDICATED
+#include "vr/vr.h"
+#endif
 
 static jmp_buf g_abortframe;
 
@@ -171,6 +174,10 @@ static void Host_RunFrame( double time )
 		Host_SetState( STATE_GAME_SHUTDOWN, false );
 		break;
 	case STATE_CHANGELEVEL:
+#if XASH_OPENXR && !XASH_DEDICATED
+		if( VR_HoldLevelChange( ))
+			break; // the game runs on while the headset fades out
+#endif
 		SCR_BeginLoadingPlaque( GameState->backgroundMap );
 		Host_SetState( GameState->nextstate, true );
 		break;
