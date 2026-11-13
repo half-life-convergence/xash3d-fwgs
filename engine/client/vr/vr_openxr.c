@@ -26,6 +26,7 @@ GNU General Public License for more details.
 #include "sound.h" // snd.origin, the listener, for vr_info
 #include "mod_local.h" // Mod_StudioExtradata, for the weapon's muzzle
 #include "studio.h" // studiohdr_t
+#include "cl_tent.h" // CL_AllocDlight, for the flashlight
 #if XASH_SDL == 2
 #include <SDL.h> // SDL_GL_SetSwapInterval for the desktop mirror window
 #endif
@@ -217,6 +218,11 @@ static struct
 	qboolean offhand_prev_valid;
 	vec3_t   offhand_prev; // last frame's drawn left hand in the gun's axes
 
+	// the flashlight, see VR_UpdateFlashlight
+	qboolean flashlight_on; // lit this frame
+	qboolean flashlight_hand; // from the left hand, else the head
+	vec3_t   flashlight_spot;
+
 	// the head center in the world, this frame, for the sound listener
 	vec3_t   head_origin;
 	vec3_t   head_angles;
@@ -265,6 +271,7 @@ static int VR_ViewmodelFlags( void );
 static CVAR_DEFINE_AUTO( vr_handcollide, "1", FCVAR_ARCHIVE, "hands and the weapon stop at walls instead of going through them" );
 static CVAR_DEFINE_AUTO( vr_weaponcollide, "1", FCVAR_ARCHIVE, "the off hand touches the weapon in the other hand instead of going through it (our VR weapon models)" );
 static CVAR_DEFINE_AUTO( vr_grab_needgrip, "1", FCVAR_ARCHIVE, "the off hand takes hold of a weapon's grab point only while squeezing grip; 0 = as soon as it's close" );
+static CVAR_DEFINE_AUTO( vr_flashlight, "1", FCVAR_ARCHIVE, "where the flashlight shines from in VR: 1 = the off hand, 0 = the head, like the HEV suit's" );
 static CVAR_DEFINE_AUTO( vr_debug_offhand, "", 0, "developer: with vr_debug_hands, put the left hand at \"forward right up\" game units from the right hand, in the gun's axes" );
 static CVAR_DEFINE_AUTO( vr_weapon_length, "12", FCVAR_ARCHIVE, "for weapon models without a muzzle point that aren't in the built-in table: how far they reach past the hand along the aim, game units" );
 static CVAR_DEFINE_AUTO( vr_loadfade, "0.5", FCVAR_ARCHIVE, "seconds the view takes to fade in after loading, 0 = no fade" );
@@ -2109,6 +2116,69 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 }
 
 /*
+VR_UpdateFlashlight
+
+Half-Life's flashlight in VR. The game keeps it as it was: impulse 100
+toggles it, the battery drains, the sounds play, and the player gets
+EF_DIMLIGHT. CL_UpdateFlashlight then lights the spot the desktop camera
+looks at. Here, after the hands are placed and before the eyes are drawn,
+the same light (same key) is moved to where the left hand points, so it
+follows the hand with no frame of lag. It shines from the head instead
+with vr_flashlight 0, or while the left hand isn't tracked. Trace,
+falloff and size are CL_UpdateFlashlight's.
+*/
+#define VR_FLASHLIGHT_DISTANCE 2000.0f // CL_UpdateFlashlight's FLASHLIGHT_DISTANCE
+
+static void VR_UpdateFlashlight( void )
+{
+	cl_entity_t *player = CL_GetLocalPlayer( );
+	vec3_t src, forward, end;
+	cl_entity_t *hit = NULL;
+	pmtrace_t tr;
+	dlight_t *dl;
+	float falloff;
+
+	vr.flashlight_on = false;
+
+	if( !player || cls.state != ca_active || Host_IsQuakeCompatible( )
+		|| !FBitSet( player->curstate.effects, EF_DIMLIGHT ) || FBitSet( player->curstate.effects, EF_BRIGHTLIGHT ))
+		return;
+
+	vr.flashlight_hand = vr_flashlight.value && vr.hand_valid[VR_HAND_LEFT];
+	if( vr.flashlight_hand )
+	{
+		VectorCopy( vr.hand_origin[VR_HAND_LEFT], src ); // kept out of walls
+		AngleVectors( vr.hand_angles[VR_HAND_LEFT], forward, NULL, NULL );
+	}
+	else
+	{
+		VectorCopy( vr.head_origin, src );
+		AngleVectors( vr.head_angles, forward, NULL, NULL );
+	}
+
+	VectorMA( src, VR_FLASHLIGHT_DISTANCE, forward, end );
+	tr = CL_TraceLine( src, end, PM_STUDIO_BOX );
+
+	dl = CL_AllocDlight( player->index );
+	if( tr.ent >= 0 && tr.ent < clgame.pmove->numphysent )
+		hit = CL_GetEntityByIndex( clgame.pmove->physents[tr.ent].info );
+	if( hit && hit->model && ( hit->model->type == mod_alias || hit->model->type == mod_studio ))
+		VectorCopy( hit->origin, dl->origin );
+	else VectorCopy( tr.endpos, dl->origin );
+
+	falloff = tr.fraction * VR_FLASHLIGHT_DISTANCE;
+	falloff = falloff < 500.0f ? 1.0f : 500.0f / falloff;
+	falloff *= falloff;
+
+	dl->color.r = dl->color.g = dl->color.b = bound( 0, falloff * 255, 255 );
+	dl->die = cl.time + 0.01f; // like CL_UpdateFlashlight, it's set again every frame
+	dl->radius = 80;
+
+	VectorCopy( dl->origin, vr.flashlight_spot );
+	vr.flashlight_on = true;
+}
+
+/*
 VR_MirrorEye
 
 Copies the eye image bound to vr.fbo into the desktop's 3D view
@@ -2219,6 +2289,7 @@ int VR_RenderEyes( const ref_viewpass_t *rvp )
 		VR_EyeView( rvp, &center, head, vr.head_origin, vr.head_angles );
 	}
 	VR_UpdateHands( rvp, head ); // after the head center, the hands keep out of the head
+	VR_UpdateFlashlight( ); // from the hand just placed
 	{
 		// the head's place in the world, for the wall check
 		float yaw = DEG2RAD( rvp->viewangles[YAW] );
@@ -3108,6 +3179,10 @@ static void VR_Info_f( void )
 			else Con_Printf( "VR: left hand %s %s (%d boxes)\n", vr.offhand_on_gun ? "against" : "clear of",
 				vr.grab_model->name, shape ? shape->num_boxes : 0 );
 		}
+		if( vr.flashlight_on )
+			Con_Printf( "VR: flashlight on, from the %s, lighting %.1f %.1f %.1f\n", vr.flashlight_hand ? "left hand" : "head",
+				vr.flashlight_spot[0], vr.flashlight_spot[1], vr.flashlight_spot[2] );
+		else Con_Printf( "VR: flashlight off\n" );
 		VR_HandsInfo( );
 	}
 }
@@ -3181,6 +3256,7 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_weaponcollide );
 	Cvar_RegisterVariable( &vr_grab_needgrip );
 	Cvar_RegisterVariable( &vr_debug_offhand );
+	Cvar_RegisterVariable( &vr_flashlight );
 	Cvar_RegisterVariable( &vr_hidearms );
 	Cvar_RegisterVariable( &vr_pinweapon );
 	Cvar_RegisterVariable( &vr_twosided );
