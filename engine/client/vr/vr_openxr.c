@@ -216,6 +216,10 @@ static struct
 	int      grab_near; // the grab point the left hand is reaching for, -1 = none
 	qboolean offhand_on_gun; // the left hand was pushed out of the weapon this frame
 	qboolean twohanded; // the gun was turned toward the left hand this frame, see VR_TwoHandedAim
+
+	// recoil, see VR_UpdateRecoil: barrel up (degrees), sideways (degrees), back (game units)
+	vec3_t   recoil;
+	vec3_t   recoil_vel;
 	qboolean offhand_prev_valid;
 	vec3_t   offhand_prev; // last frame's drawn left hand in the gun's axes
 
@@ -271,6 +275,8 @@ static int VR_ViewmodelFlags( void );
 static CVAR_DEFINE_AUTO( vr_handcollide, "1", FCVAR_ARCHIVE, "hands and the weapon stop at walls instead of going through them" );
 static CVAR_DEFINE_AUTO( vr_weaponcollide, "1", FCVAR_ARCHIVE, "the off hand touches the weapon in the other hand instead of going through it (our VR weapon models)" );
 static CVAR_DEFINE_AUTO( vr_grab_needgrip, "1", FCVAR_ARCHIVE, "the off hand takes hold of a weapon's grab point only while squeezing grip; 0 = as soon as it's close" );
+static CVAR_DEFINE_AUTO( vr_recoil, "1", FCVAR_ARCHIVE, "how hard shots kick the gun hand: 1 = Half-Life's punch per weapon, 0 = no kick" );
+static CVAR_DEFINE_AUTO( vr_recoil_pending, "0", 0, "internal: degrees of punch the client's weapon events added since the last frame; only the value is used, the string isn't kept up to date" );
 static CVAR_DEFINE_AUTO( vr_twohanded, "1", FCVAR_ARCHIVE, "while the off hand holds a weapon's grab point, the weapon aims along the line between the hands" );
 static CVAR_DEFINE_AUTO( vr_debug_offhand, "", 0, "developer: with vr_debug_hands, put the left hand at \"forward right up\" game units from the right hand, in the gun's axes" );
 static CVAR_DEFINE_AUTO( vr_weapon_length, "12", FCVAR_ARCHIVE, "for weapon models without a muzzle point that aren't in the built-in table: how far they reach past the hand along the aim, game units" );
@@ -1908,6 +1914,102 @@ static qboolean VR_TwoHandedAim( const vec3_t grab )
 	return true;
 }
 
+/*
+VR_UpdateRecoil
+
+Once a frame, before the gun hand is placed. The client's weapon events
+add Half-Life's per-shot punch (degrees) to vr_recoil_pending (see
+V_PunchAxis in hlsdk's view.cpp); each shot gives a critically damped
+spring a kick: the barrel up by the punch, a little sideways at random,
+and back by VR_RECOIL_BACK per degree. The spring peaks after about
+1/VR_RECOIL_OMEGA seconds and settles in about 0.15 s, so at the MP5's
+10 shots a second the kicks only add up a little (a lower omega makes
+automatic fire climb more). Fixed small steps keep it the same at any
+frame rate.
+*/
+#define VR_RECOIL_OMEGA 30.0f // 1/s, the spring's speed
+#define VR_RECOIL_BACK  0.4f  // game units back per degree of punch
+#define VR_RECOIL_MAX_UP   20.0f // degrees
+#define VR_RECOIL_MAX_SIDE 8.0f  // degrees
+#define VR_RECOIL_MAX_BACK 4.0f  // game units (~10 cm)
+
+static void VR_UpdateRecoil( void )
+{
+	const float limit[3] = { VR_RECOIL_MAX_UP, VR_RECOIL_MAX_SIDE, VR_RECOIL_MAX_BACK };
+	float dt = bound( 0.0f, (float)host.realframetime, 0.1f );
+	float punch = vr_recoil_pending.value;
+	int i;
+
+	vr_recoil_pending.value = 0.0f; // taken; only the value is shared
+
+	if( punch > 0.0f && vr_recoil.value > 0.0f )
+	{
+		// from rest, a spring kicked with v peaks at v / (omega * e)
+		const float k = vr_recoil.value * punch * VR_RECOIL_OMEGA * 2.71828f;
+
+		vr.recoil_vel[0] += k;
+		vr.recoil_vel[1] += k * COM_RandomFloat( -0.25f, 0.25f );
+		vr.recoil_vel[2] += Q_min( vr_recoil.value * punch * VR_RECOIL_BACK, VR_RECOIL_MAX_BACK ) * VR_RECOIL_OMEGA * 2.71828f;
+	}
+
+	while( dt > 0.0f )
+	{
+		float h = Q_min( dt, 0.004f );
+
+		for( i = 0; i < 3; i++ )
+		{
+			vr.recoil_vel[i] += ( -VR_RECOIL_OMEGA * VR_RECOIL_OMEGA * vr.recoil[i] - 2.0f * VR_RECOIL_OMEGA * vr.recoil_vel[i] ) * h;
+			vr.recoil[i] += vr.recoil_vel[i] * h;
+		}
+		dt -= h;
+	}
+
+	for( i = 0; i < 3; i++ )
+	{
+		if( fabsf( vr.recoil[i] ) > limit[i] )
+		{
+			vr.recoil[i] = vr.recoil[i] > 0.0f ? limit[i] : -limit[i];
+			vr.recoil_vel[i] = 0.0f;
+		}
+	}
+}
+
+/*
+VR_ApplyRecoil
+
+The kick on the gun hand, before its wall check: the barrel turns up
+around the gun's own right axis and sideways around its up axis, both
+about the grip, and the grip moves back along the barrel. It changes the
+hand's angles, so the next shots aim with the kick, like Half-Life's
+punch did.
+*/
+static void VR_ApplyRecoil( int hand )
+{
+	vec3_t f, r, u, nf, nr, nu;
+	float a;
+
+	if( VectorIsNull( vr.recoil ))
+		return;
+
+	AngleVectors( vr.hand_angles[hand], f, r, u );
+
+	// back first, along the barrel before it turns
+	VectorMA( vr.hand_tracked[hand], -vr.recoil[2], f, vr.hand_tracked[hand] );
+
+	// barrel up: around the right axis (right x forward = up in Quake's axes)
+	a = DEG2RAD( vr.recoil[0] );
+	VR_RotateAround( f, r, cosf( a ), sinf( a ), nf );
+	VR_RotateAround( u, r, cosf( a ), sinf( a ), nu );
+	VectorCopy( r, nr );
+
+	// sideways: around the gun's (turned) up axis
+	a = DEG2RAD( vr.recoil[1] );
+	VR_RotateAround( nf, nu, cosf( a ), sinf( a ), f );
+	VR_RotateAround( nr, nu, cosf( a ), sinf( a ), r );
+
+	VectorsAngles( f, r, nu, vr.hand_angles[hand] );
+}
+
 // how far the left controller is from holding the grab point: along the
 // line from the grip while aiming with two hands (steering doesn't count),
 // else straight
@@ -2092,6 +2194,7 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 	}
 
 	VR_MeasureMuzzle( ); // once per weapon model
+	VR_UpdateRecoil( ); // once per frame
 
 	// the right hand first, so vr_debug_offhand can place the left one from it
 	for( int n = 0; n < 2; n++ )
@@ -2151,6 +2254,10 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 			VR_GunToWorld( f, r, u, o, ofs );
 			VectorAdd( vr.hand_tracked[VR_HAND_RIGHT], ofs, vr.hand_tracked[hand] );
 		}
+
+		// the gun hand takes the shots' kick before its wall check
+		if( hand == VR_HAND_RIGHT && vr_handweapon.value && clgame.viewent.model )
+			VR_ApplyRecoil( hand );
 
 		VR_CollideHand( hand, hand == VR_HAND_RIGHT && vr_handweapon.value && clgame.viewent.model );
 	}
@@ -3271,6 +3378,7 @@ static void VR_Info_f( void )
 			else Con_Printf( "VR: left hand %s %s (%d boxes)\n", vr.offhand_on_gun ? "against" : "clear of",
 				vr.grab_model->name, shape ? shape->num_boxes : 0 );
 		}
+		Con_Printf( "VR: recoil: barrel up %.1f, sideways %.1f degrees, back %.1f units\n", vr.recoil[0], vr.recoil[1], vr.recoil[2] );
 		if( vr.flashlight_on )
 			Con_Printf( "VR: flashlight on, lighting %.1f %.1f %.1f\n",
 				vr.flashlight_spot[0], vr.flashlight_spot[1], vr.flashlight_spot[2] );
@@ -3351,6 +3459,8 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_grab_needgrip );
 	Cvar_RegisterVariable( &vr_debug_offhand );
 	Cvar_RegisterVariable( &vr_twohanded );
+	Cvar_RegisterVariable( &vr_recoil );
+	Cvar_RegisterVariable( &vr_recoil_pending );
 	Cvar_RegisterVariable( &vr_hidearms );
 	Cvar_RegisterVariable( &vr_pinweapon );
 	Cvar_RegisterVariable( &vr_twosided );
