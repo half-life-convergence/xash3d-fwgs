@@ -215,6 +215,7 @@ static struct
 	int      grab_point; // the grab point the left hand holds, -1 = none
 	int      grab_near; // the grab point the left hand is reaching for, -1 = none
 	qboolean offhand_on_gun; // the left hand was pushed out of the weapon this frame
+	qboolean twohanded; // the gun was turned toward the left hand this frame, see VR_TwoHandedAim
 	qboolean offhand_prev_valid;
 	vec3_t   offhand_prev; // last frame's drawn left hand in the gun's axes
 
@@ -270,6 +271,7 @@ static int VR_ViewmodelFlags( void );
 static CVAR_DEFINE_AUTO( vr_handcollide, "1", FCVAR_ARCHIVE, "hands and the weapon stop at walls instead of going through them" );
 static CVAR_DEFINE_AUTO( vr_weaponcollide, "1", FCVAR_ARCHIVE, "the off hand touches the weapon in the other hand instead of going through it (our VR weapon models)" );
 static CVAR_DEFINE_AUTO( vr_grab_needgrip, "1", FCVAR_ARCHIVE, "the off hand takes hold of a weapon's grab point only while squeezing grip; 0 = as soon as it's close" );
+static CVAR_DEFINE_AUTO( vr_twohanded, "1", FCVAR_ARCHIVE, "while the off hand holds a weapon's grab point, the weapon aims along the line between the hands" );
 static CVAR_DEFINE_AUTO( vr_debug_offhand, "", 0, "developer: with vr_debug_hands, put the left hand at \"forward right up\" game units from the right hand, in the gun's axes" );
 static CVAR_DEFINE_AUTO( vr_weapon_length, "12", FCVAR_ARCHIVE, "for weapon models without a muzzle point that aren't in the built-in table: how far they reach past the hand along the aim, game units" );
 static CVAR_DEFINE_AUTO( vr_loadfade, "0.5", FCVAR_ARCHIVE, "seconds the view takes to fade in after loading, 0 = no fade" );
@@ -1846,6 +1848,78 @@ static qboolean VR_PushOutOfBox( const vr_weapon_box_t *box, vec3_t pos, const v
 	return true;
 }
 
+// a vector turned around a unit axis (Rodrigues)
+static void VR_RotateAround( const vec3_t v, const vec3_t axis, float c, float s, vec3_t out )
+{
+	vec3_t kv;
+	float kd = DotProduct( axis, v ) * ( 1.0f - c );
+
+	CrossProduct( axis, v, kv );
+	out[0] = v[0] * c + kv[0] * s + axis[0] * kd;
+	out[1] = v[1] * c + kv[1] * s + axis[1] * kd;
+	out[2] = v[2] * c + kv[2] * s + axis[2] * kd;
+}
+
+/*
+VR_TwoHandedAim
+
+The left hand holds a grab point (in the gun's axes): turn the gun, the
+shortest way, so that grab point lies on the line from the right grip to
+the left controller. The roll stays the right hand's. Shots follow,
+because they use the right hand's angles. The right hand's wall check
+then runs again with the new angles, so the barrel still stops at walls.
+Skipped for a grab point too close to the grip to steer with, or with
+the controller behind the grip. Returns true if it turned the gun.
+*/
+#define VR_TWOHAND_MIN 2.0f // game units: grab points closer to the grip than this don't steer
+
+static qboolean VR_TwoHandedAim( const vec3_t grab )
+{
+	const int gun = VR_HAND_RIGHT, off = VR_HAND_LEFT;
+	vec3_t f, r, u, a, b, axis, nf, nr, nu;
+	float s, c;
+
+	if( !vr_twohanded.value || VectorLength( grab ) < VR_TWOHAND_MIN )
+		return false;
+
+	AngleVectors( vr.hand_angles[gun], f, r, u );
+	VR_GunToWorld( f, r, u, grab, a ); // where the grab point is now, from the grip
+	VectorSubtract( vr.hand_tracked[off], vr.hand_origin[gun], b ); // where the controller is
+	if( VectorNormalizeLength( b ) < VR_TWOHAND_MIN )
+		return false;
+	VectorNormalize( a );
+
+	c = DotProduct( a, b );
+	if( c < 0.0f )
+		return false; // the controller is behind the grip
+
+	CrossProduct( a, b, axis );
+	s = VectorLength( axis );
+	if( s < 0.0001f )
+		return true; // already in line
+	VectorScale( axis, 1.0f / s, axis );
+
+	VR_RotateAround( f, axis, c, s, nf );
+	VR_RotateAround( r, axis, c, s, nr );
+	VR_RotateAround( u, axis, c, s, nu );
+	VectorsAngles( nf, nr, nu, vr.hand_angles[gun] );
+
+	VR_CollideHand( gun, true );
+	return true;
+}
+
+// how far the left controller is from holding the grab point: along the
+// line from the grip while aiming with two hands (steering doesn't count),
+// else straight
+static float VR_GrabDistance( const vec3_t tracked, const vec3_t grab )
+{
+	float lt = VectorLength( tracked ), lg = VectorLength( grab );
+
+	if( vr_twohanded.value && lg >= VR_TWOHAND_MIN && lt > 0.0001f && DotProduct( tracked, grab ) > 0.0f )
+		return fabsf( lt - lg );
+	return VectorDistance( tracked, grab );
+}
+
 /*
 VR_OffhandWeapon
 
@@ -1878,6 +1952,7 @@ static void VR_OffhandWeapon( void )
 
 	vr.hand_pose[off] = vr.hand_pose[gun] = -1;
 	vr.grab_near = -1;
+	vr.twohanded = false;
 	vr.offhand_on_gun = false;
 
 	if( !vr_weaponcollide.value || !vr_handweapon.value || !vr.hand_valid[off] || !vr.hand_valid[gun]
@@ -1906,7 +1981,7 @@ static void VR_OffhandWeapon( void )
 	{
 		const vr_grab_point_t *g = &shape->grabs[vr.grab_point];
 
-		if( VectorDistance( tracked, g->origin ) > g->radius + VR_GRAB_BREAK
+		if( VR_GrabDistance( tracked, g->origin ) > g->radius + VR_GRAB_BREAK
 			|| ( vr_grab_needgrip.value && squeeze < VR_GRAB_LET_GO ))
 			vr.grab_point = -1;
 	}
@@ -1931,6 +2006,11 @@ static void VR_OffhandWeapon( void )
 	{
 		const vr_grab_point_t *g = &shape->grabs[vr.grab_point];
 		vec3_t lf, lr, lu, wf, wr, wu;
+
+		// two hands: the gun turns toward the left controller first
+		vr.twohanded = VR_TwoHandedAim( g->origin );
+		if( vr.twohanded )
+			AngleVectors( vr.hand_angles[gun], f, r, u );
 
 		VR_GunToWorld( f, r, u, g->origin, world );
 		VectorAdd( vr.hand_origin[gun], world, vr.hand_origin[off] );
@@ -3184,7 +3264,8 @@ static void VR_Info_f( void )
 				c[0], c[1], c[2], d[0], d[1], d[2] );
 
 			if( shape && vr.grab_point >= 0 && vr.grab_point < shape->num_grabs )
-				Con_Printf( "VR: left hand holds grab point \"%s\" of %s\n", shape->grabs[vr.grab_point].name, vr.grab_model->name );
+				Con_Printf( "VR: left hand holds grab point \"%s\" of %s%s\n", shape->grabs[vr.grab_point].name, vr.grab_model->name,
+					vr.twohanded ? ", aiming with both hands" : "" );
 			else if( shape && vr.grab_near >= 0 && vr.grab_near < shape->num_grabs )
 				Con_Printf( "VR: left hand reaching for grab point \"%s\" of %s\n", shape->grabs[vr.grab_near].name, vr.grab_model->name );
 			else Con_Printf( "VR: left hand %s %s (%d boxes)\n", vr.offhand_on_gun ? "against" : "clear of",
@@ -3269,6 +3350,7 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_weaponcollide );
 	Cvar_RegisterVariable( &vr_grab_needgrip );
 	Cvar_RegisterVariable( &vr_debug_offhand );
+	Cvar_RegisterVariable( &vr_twohanded );
 	Cvar_RegisterVariable( &vr_hidearms );
 	Cvar_RegisterVariable( &vr_pinweapon );
 	Cvar_RegisterVariable( &vr_twosided );
