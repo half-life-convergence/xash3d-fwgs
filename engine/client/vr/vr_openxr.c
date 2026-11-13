@@ -2129,6 +2129,29 @@ falloff and size are CL_UpdateFlashlight's.
 */
 #define VR_FLASHLIGHT_DISTANCE 2000.0f // CL_UpdateFlashlight's FLASHLIGHT_DISTANCE
 
+/*
+VR_HeadlampZone
+
+With the flashlight on the head (vr_flashlight 0), it switches like a
+headlamp: the left trigger pulled with the left controller beside the
+left temple (vr_input.c). True while the controller is in that zone.
+Uses the last placed hands and head, so the frame before's.
+*/
+#define VR_HEADLAMP_SIDE   5.0f // game units (~13 cm) left of the head center: the palm with the fingers at the temple
+#define VR_HEADLAMP_RADIUS 4.5f // game units (~11 cm) around that
+
+qboolean VR_HeadlampZone( void )
+{
+	vec3_t right, spot;
+
+	if( vr_flashlight.value || !vr.hand_valid[VR_HAND_LEFT] || cls.state != ca_active )
+		return false;
+
+	AngleVectors( vr.head_angles, NULL, right, NULL );
+	VectorMA( vr.head_origin, -VR_HEADLAMP_SIDE, right, spot );
+	return VectorDistance( vr.hand_tracked[VR_HAND_LEFT], spot ) < VR_HEADLAMP_RADIUS;
+}
+
 static void VR_UpdateFlashlight( void )
 {
 	cl_entity_t *player = CL_GetLocalPlayer( );
@@ -3183,6 +3206,8 @@ static void VR_Info_f( void )
 			Con_Printf( "VR: flashlight on, from the %s, lighting %.1f %.1f %.1f\n", vr.flashlight_hand ? "left hand" : "head",
 				vr.flashlight_spot[0], vr.flashlight_spot[1], vr.flashlight_spot[2] );
 		else Con_Printf( "VR: flashlight off\n" );
+		if( VR_HeadlampZone( ))
+			Con_Printf( "VR: left hand at the head flashlight's switch\n" );
 		VR_HandsInfo( );
 	}
 }

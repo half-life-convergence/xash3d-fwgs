@@ -196,6 +196,7 @@ static struct
 	qboolean     flashlight_was_down;
 	qboolean     flashlight_debug_press; // vr_debug_flashlightpress
 	qboolean     flashlight_pending; // pressed, VR_CreateMove sends impulse 100
+	qboolean     headlamp_pull; // the left trigger was pulled at the head flashlight's switch and is still held
 	qboolean     snap_armed; // the turn stick went back to center since the last snap
 	qboolean     flick_armed; // same for weapon flicks
 	qboolean     crouch_was_down;
@@ -610,6 +611,31 @@ void VR_PreCreateMove( float frametime )
 	if( vri.flashlight && !vri.flashlight_was_down && cls.key_dest == key_game )
 		vri.flashlight_pending = true;
 	vri.flashlight_was_down = vri.flashlight;
+
+	// the head flashlight (vr_flashlight 0) also switches like a headlamp:
+	// the left trigger pulled beside the left temple. The trigger is alt fire
+	// too, so alt fire waits while the hand is there or that pull is held.
+	{
+		qboolean at_lamp = VR_HeadlampZone( );
+		float trigger, squeeze;
+
+		VR_HandFingers( VR_HAND_LEFT, &trigger, &squeeze );
+
+		if( vri.headlamp_pull )
+		{
+			if( trigger < 0.3f )
+				vri.headlamp_pull = false;
+		}
+		else if( at_lamp && trigger > 0.7f )
+		{
+			vri.headlamp_pull = true;
+			if( cls.key_dest == key_game )
+				vri.flashlight_pending = true;
+		}
+
+		if( at_lamp || vri.headlamp_pull )
+			ClearBits( vri.buttons, IN_ATTACK2 );
+	}
 
 	tx = VR_Deadzone( vri.turn.x );
 
