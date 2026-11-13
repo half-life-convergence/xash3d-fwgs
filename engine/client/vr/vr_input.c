@@ -36,6 +36,7 @@ static PFN_xrGetCurrentInteractionProfile      pxrGetCurrentInteractionProfile;
 static PFN_xrCreateActionSpace                 pxrCreateActionSpace;
 static PFN_xrLocateSpace                       pxrLocateSpace;
 static PFN_xrDestroySpace                      pxrDestroySpace;
+static PFN_xrApplyHapticFeedback               pxrApplyHapticFeedback;
 
 static CVAR_DEFINE_AUTO( vr_turnmode, "0", FCVAR_ARCHIVE, "right stick turning: 0 = snap (comfortable), 1 = smooth" );
 static CVAR_DEFINE_AUTO( vr_snapturn, "45", FCVAR_ARCHIVE, "degrees per snap turn" );
@@ -72,6 +73,7 @@ typedef enum
 	VR_ACT_FINGER_SQUEEZE, // float, per hand: how hard the grip is squeezed, for the hand model
 	VR_ACT_GRIP_POSE, // pose, per hand: where the hand holds things
 	VR_ACT_AIM_POSE, // pose, per hand: the pointing ray
+	VR_ACT_HAPTIC, // vibration output, per hand
 	VR_ACT_COUNT
 } vr_action_t;
 
@@ -98,10 +100,12 @@ static const vr_action_def_t vr_action_defs[VR_ACT_COUNT] =
 	{ "finger_squeeze", "Hand closing (hand pose)", XR_ACTION_TYPE_FLOAT_INPUT, 0 },
 	{ "hand_grip", "Hand grip pose", XR_ACTION_TYPE_POSE_INPUT, 0 },
 	{ "hand_aim", "Hand aim pose", XR_ACTION_TYPE_POSE_INPUT, 0 },
+	{ "haptic", "Vibration", XR_ACTION_TYPE_VIBRATION_OUTPUT, 0 },
 };
 
 // the pose and finger actions are per hand
-#define VR_ACTION_PER_HAND( i ) ( vr_action_defs[i].type == XR_ACTION_TYPE_POSE_INPUT || vr_action_defs[i].type == XR_ACTION_TYPE_FLOAT_INPUT )
+#define VR_ACTION_PER_HAND( i ) ( vr_action_defs[i].type == XR_ACTION_TYPE_POSE_INPUT || vr_action_defs[i].type == XR_ACTION_TYPE_FLOAT_INPUT \
+	|| vr_action_defs[i].type == XR_ACTION_TYPE_VIBRATION_OUTPUT )
 
 typedef struct
 {
@@ -116,7 +120,9 @@ typedef struct
 	{ VR_ACT_GRIP_POSE, "/user/hand/left/input/grip/pose" }, \
 	{ VR_ACT_GRIP_POSE, "/user/hand/right/input/grip/pose" }, \
 	{ VR_ACT_AIM_POSE, "/user/hand/left/input/aim/pose" }, \
-	{ VR_ACT_AIM_POSE, "/user/hand/right/input/aim/pose" }
+	{ VR_ACT_AIM_POSE, "/user/hand/right/input/aim/pose" }, \
+	{ VR_ACT_HAPTIC, "/user/hand/left/output/haptic" }, \
+	{ VR_ACT_HAPTIC, "/user/hand/right/output/haptic" }
 
 // both trigger and squeeze report a value on the Index and Touch profiles
 #define VR_HAND_FINGERS 	{ VR_ACT_FINGER_TRIGGER, "/user/hand/left/input/trigger/value" }, 	{ VR_ACT_FINGER_TRIGGER, "/user/hand/right/input/trigger/value" }, 	{ VR_ACT_FINGER_SQUEEZE, "/user/hand/left/input/squeeze/value" }, 	{ VR_ACT_FINGER_SQUEEZE, "/user/hand/right/input/squeeze/value" }
@@ -221,7 +227,8 @@ static qboolean VR_LoadInputProcs( void )
 		&& VR_LOAD_PROC( xrGetCurrentInteractionProfile )
 		&& VR_LOAD_PROC( xrCreateActionSpace )
 		&& VR_LOAD_PROC( xrLocateSpace )
-		&& VR_LOAD_PROC( xrDestroySpace );
+		&& VR_LOAD_PROC( xrDestroySpace )
+		&& VR_LOAD_PROC( xrApplyHapticFeedback );
 }
 
 static XrPath VR_Path( const char *str )
@@ -504,6 +511,28 @@ void VR_HandFingers( int hand, float *trigger, float *squeeze )
 	*squeeze = vri.fingers[hand][1];
 }
 
+/*
+VR_Haptic
+
+A short buzz in one controller. Fire and forget: the runtime plays it on
+its own, nothing waits.
+*/
+void VR_Haptic( int hand, float seconds, float amplitude )
+{
+	XrHapticActionInfo info = { XR_TYPE_HAPTIC_ACTION_INFO };
+	XrHapticVibration vib = { XR_TYPE_HAPTIC_VIBRATION };
+
+	if( !vri.initialized || hand < 0 || hand > 1 || !VR_SessionFocused( ))
+		return;
+
+	info.action = vri.actions[VR_ACT_HAPTIC];
+	info.subactionPath = vri.hand_paths[hand];
+	vib.duration = (XrDuration)( seconds * 1e9f );
+	vib.frequency = XR_FREQUENCY_UNSPECIFIED;
+	vib.amplitude = bound( 0.0f, amplitude, 1.0f );
+	pxrApplyHapticFeedback( VR_GetSession( ), &info, (const XrHapticBaseHeader *)&vib );
+}
+
 static void VR_ReadActions( void )
 {
 	XrActiveActionSet active = { 0 };
@@ -775,7 +804,17 @@ void VR_CreateMove( usercmd_t *cmd )
 	if( !vri.initialized || !VR_Active( ))
 		return;
 
-	cmd->buttons |= VR_CrouchButtons( cmd->buttons );
+	{
+		int buttons = VR_CrouchButtons( cmd->buttons );
+
+		// with reloading by hand the reload button waits for the magazine eject
+		if( VR_ManualReload( ))
+			ClearBits( buttons, IN_RELOAD );
+		cmd->buttons |= buttons;
+	}
+
+	// the ammo just went in: press reload for the game
+	VR_ReloadCommand( cmd );
 
 	// the flashlight switch, unless the command already carries an impulse
 	// (it waits for the next one then)

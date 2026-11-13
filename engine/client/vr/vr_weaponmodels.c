@@ -49,6 +49,11 @@ GNU General Public License for more details.
 //   to the gun (0 0 0 points it the same way), radius is how close the hand
 //   snaps from, animation is the pose from hands.mdl (falls back to
 //   grab_default, then a closed "hand"). "//" starts a comment.
+//
+//   magwell <forward> <right> <up> <radius>
+//
+//   where the off hand puts ammo in to reload (vr_reload.c), instead of the
+//   place guessed for Half-Life's model.
 static CVAR_DEFINE_AUTO( vr_weaponmodels, "1", FCVAR_ARCHIVE, "hold our own VR weapon models (models/vr/) instead of Half-Life's where they exist" );
 
 #define VR_MAX_WEAPON_MODELS 32
@@ -210,6 +215,7 @@ static void VR_LoadGrabPoints( const char *modelpath, vr_weapon_shape_t *shape )
 	char *data, *p;
 
 	shape->num_grabs = 0;
+	shape->has_magwell = false;
 
 	Q_strncpy( path, modelpath, sizeof( path ));
 	COM_ReplaceExtension( path, ".txt", sizeof( path ));
@@ -221,6 +227,28 @@ static void VR_LoadGrabPoints( const char *modelpath, vr_weapon_shape_t *shape )
 	{
 		vr_grab_point_t *g;
 		float v[7];
+
+		if( !Q_stricmp( token, "magwell" ))
+		{
+			// magwell <forward> <right> <up> <radius>: where ammo goes in (vr_reload.c)
+			int i;
+
+			for( i = 0; i < 4; i++ )
+			{
+				if( !( p = COM_ParseFile( p, token, sizeof( token ))))
+					break;
+				v[i] = Q_atof( token );
+			}
+			if( i < 4 )
+			{
+				Con_Printf( S_WARN "VR: %s: magwell is incomplete\n", path );
+				break;
+			}
+			VectorSet( shape->magwell, v[0], v[1], v[2] );
+			shape->magwell_radius = Q_max( 0.5f, v[3] );
+			shape->has_magwell = true;
+			continue;
+		}
 
 		if( Q_stricmp( token, "grab" ))
 		{
@@ -337,6 +365,7 @@ void VR_LoadModels( void )
 	VR_LoadWeaponModels( );
 	VR_LoadHandModel( );
 	VR_ResolveGrabPoses( );
+	VR_LoadReloadModels( );
 }
 
 const vr_weapon_shape_t *VR_WeaponShape( const model_t *vrmodel )

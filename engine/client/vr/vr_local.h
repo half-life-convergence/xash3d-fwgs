@@ -80,6 +80,9 @@ typedef struct
 	qboolean        from_hitboxes; // else one box per bone from the vertices
 	int             num_grabs;
 	vr_grab_point_t grabs[VR_MAX_GRAB_POINTS];
+	qboolean        has_magwell;    // "magwell" line: where ammo goes in, else vr_reload.c's table
+	vec3_t          magwell;
+	float           magwell_radius;
 } vr_weapon_shape_t;
 
 void VR_WeaponModelsInit( void );                // registers its cvar, from VR_Init
@@ -96,8 +99,21 @@ int VR_HandSequence( const char *name ); // a hands.mdl animation by name, -1 if
 void VR_AddHands( const qboolean valid[2], const vec3_t origin[2], const vec3_t angles[2], const model_t *held, const int pose[2] ); // end of VR_UpdateHands; pose: -1 = from the fingers, else a grab pose
 void VR_HandsInfo( void );      // for vr_info
 
+// vr_reload.c
+void VR_ReloadInit( void );        // registers its cvar, from VR_Init
+void VR_LoadReloadModels( void );  // with the map, from VR_LoadModels, after the hands
+void VR_UpdateReload( const model_t *weapon, const model_t *drawn, qboolean gun_valid, const vec3_t gun_origin, const vec3_t gun_angles,
+	qboolean off_valid, const vec3_t off_tracked, const vec3_t head_origin, float head_yaw ); // from VR_UpdateHands, before VR_OffhandWeapon
+qboolean VR_ReloadHolding( void ); // the left hand holds ammo, so it leaves the gun alone
+int VR_ReloadHandPose( void );     // the left hand's pose while it does
+qboolean VR_ManualReload( void );  // vr_manualreload: no reload button, no automatic reload
+void VR_ReloadCommand( usercmd_t *cmd ); // from VR_CreateMove: presses reload when the ammo went in
+void VR_AddHeldAmmo( const vec3_t origin, const vec3_t angles ); // after VR_AddHands
+void VR_ReloadInfo( void );        // for vr_info
+
 // vr_input.c
 void VR_HandFingers( int hand, float *trigger, float *squeeze ); // 0 to 1, for the hand poses
+void VR_Haptic( int hand, float seconds, float amplitude ); // a buzz in a controller, amplitude 0 to 1
 
 #define VR_LOAD_PROC( name ) VR_LoadProc( VR_GetInstance( ), #name, (PFN_xrVoidFunction *)&p##name )
 

@@ -2060,6 +2060,15 @@ static void VR_OffhandWeapon( void )
 	vr.twohanded = false;
 	vr.offhand_on_gun = false;
 
+	// a hand holding ammo goes to the magazine well, through the gun if need be
+	if( VR_ReloadHolding( ))
+	{
+		vr.grab_point = -1;
+		vr.offhand_prev_valid = false;
+		vr.hand_pose[off] = VR_ReloadHandPose( );
+		return;
+	}
+
 	if( !vr_weaponcollide.value || !vr_handweapon.value || !vr.hand_valid[off] || !vr.hand_valid[gun]
 		|| !Cvar_VariableValue( "r_drawviewmodel" ) || !( shape = VR_WeaponShape( model )))
 	{
@@ -2265,6 +2274,11 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 		VR_CollideHand( hand, hand == VR_HAND_RIGHT && vr_handweapon.value && clgame.viewent.model );
 	}
 
+	// ammo from over the shoulder into the gun (head center already placed)
+	VR_UpdateReload( held, clgame.viewent.model, held && vr.hand_valid[VR_HAND_RIGHT] && Cvar_VariableValue( "r_drawviewmodel" ),
+		vr.hand_origin[VR_HAND_RIGHT], vr.hand_angles[VR_HAND_RIGHT],
+		vr.hand_valid[VR_HAND_LEFT], vr.hand_tracked[VR_HAND_LEFT], vr.head_origin, vr.head_angles[YAW] );
+
 	VR_OffhandWeapon( );
 
 	if( vr_handweapon.value && vr.hand_valid[VR_HAND_RIGHT] )
@@ -2301,6 +2315,8 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 	if( !vr_handweapon.value || !vr.hand_valid[VR_HAND_RIGHT] || !Cvar_VariableValue( "r_drawviewmodel" ))
 		held = NULL;
 	VR_AddHands( vr.hand_valid, (const vec3_t *)vr.hand_origin, (const vec3_t *)vr.hand_angles, held, vr.hand_pose );
+	if( vr.hand_valid[VR_HAND_LEFT] )
+		VR_AddHeldAmmo( vr.hand_origin[VR_HAND_LEFT], vr.hand_angles[VR_HAND_LEFT] );
 }
 
 /*
@@ -3453,6 +3469,7 @@ static void VR_Info_f( void )
 		else Con_Printf( "VR: flashlight off\n" );
 		if( VR_HeadlampZone( ))
 			Con_Printf( "VR: left hand at the head flashlight's switch\n" );
+		VR_ReloadInfo( );
 		VR_HandsInfo( );
 	}
 }
@@ -3534,6 +3551,7 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_twosided );
 	VR_WeaponModelsInit( );
 	VR_HandsInit( );
+	VR_ReloadInit( );
 	Cvar_RegisterVariable( &vr_weapon_length );
 	Cvar_RegisterVariable( &vr_loadfade );
 	Cvar_RegisterVariable( &vr_levelfade );
