@@ -220,7 +220,6 @@ static struct
 
 	// the flashlight, see VR_UpdateFlashlight
 	qboolean flashlight_on; // lit this frame
-	qboolean flashlight_hand; // from the left hand, else the head
 	vec3_t   flashlight_spot;
 
 	// the head center in the world, this frame, for the sound listener
@@ -271,7 +270,6 @@ static int VR_ViewmodelFlags( void );
 static CVAR_DEFINE_AUTO( vr_handcollide, "1", FCVAR_ARCHIVE, "hands and the weapon stop at walls instead of going through them" );
 static CVAR_DEFINE_AUTO( vr_weaponcollide, "1", FCVAR_ARCHIVE, "the off hand touches the weapon in the other hand instead of going through it (our VR weapon models)" );
 static CVAR_DEFINE_AUTO( vr_grab_needgrip, "1", FCVAR_ARCHIVE, "the off hand takes hold of a weapon's grab point only while squeezing grip; 0 = as soon as it's close" );
-static CVAR_DEFINE_AUTO( vr_flashlight, "1", FCVAR_ARCHIVE, "where the flashlight shines from in VR: 1 = the off hand, 0 = the head, like the HEV suit's" );
 static CVAR_DEFINE_AUTO( vr_debug_offhand, "", 0, "developer: with vr_debug_hands, put the left hand at \"forward right up\" game units from the right hand, in the gun's axes" );
 static CVAR_DEFINE_AUTO( vr_weapon_length, "12", FCVAR_ARCHIVE, "for weapon models without a muzzle point that aren't in the built-in table: how far they reach past the hand along the aim, game units" );
 static CVAR_DEFINE_AUTO( vr_loadfade, "0.5", FCVAR_ARCHIVE, "seconds the view takes to fade in after loading, 0 = no fade" );
@@ -2121,21 +2119,20 @@ VR_UpdateFlashlight
 Half-Life's flashlight in VR. The game keeps it as it was: impulse 100
 toggles it, the battery drains, the sounds play, and the player gets
 EF_DIMLIGHT. CL_UpdateFlashlight then lights the spot the desktop camera
-looks at. Here, after the hands are placed and before the eyes are drawn,
-the same light (same key) is moved to where the left hand points, so it
-follows the hand with no frame of lag. It shines from the head instead
-with vr_flashlight 0, or while the left hand isn't tracked. Trace,
-falloff and size are CL_UpdateFlashlight's.
+looks at, which isn't where the headset looks. Here, after the head is
+placed and before the eyes are drawn, the same light (same key) is moved
+to where the real head looks, like the HEV suit's headlamp, with no frame
+of lag. Trace, falloff and size are CL_UpdateFlashlight's.
 */
 #define VR_FLASHLIGHT_DISTANCE 2000.0f // CL_UpdateFlashlight's FLASHLIGHT_DISTANCE
 
 /*
 VR_HeadlampZone
 
-With the flashlight on the head (vr_flashlight 0), it switches like a
-headlamp: the left trigger pulled with the left controller beside the
-left temple (vr_input.c). True while the controller is in that zone.
-Uses the last placed hands and head, so the frame before's.
+The flashlight switches like a headlamp: the left trigger pulled with the
+left controller beside the left temple (vr_input.c). True while the
+controller is in that zone. Uses the last placed hands and head, so the
+frame before's.
 */
 #define VR_HEADLAMP_SIDE   5.0f // game units (~13 cm) left of the head center: the palm with the fingers at the temple
 #define VR_HEADLAMP_RADIUS 4.5f // game units (~11 cm) around that
@@ -2144,7 +2141,7 @@ qboolean VR_HeadlampZone( void )
 {
 	vec3_t right, spot;
 
-	if( vr_flashlight.value || !vr.hand_valid[VR_HAND_LEFT] || cls.state != ca_active )
+	if( !vr.hand_valid[VR_HAND_LEFT] || cls.state != ca_active )
 		return false;
 
 	AngleVectors( vr.head_angles, NULL, right, NULL );
@@ -2167,17 +2164,8 @@ static void VR_UpdateFlashlight( void )
 		|| !FBitSet( player->curstate.effects, EF_DIMLIGHT ) || FBitSet( player->curstate.effects, EF_BRIGHTLIGHT ))
 		return;
 
-	vr.flashlight_hand = vr_flashlight.value && vr.hand_valid[VR_HAND_LEFT];
-	if( vr.flashlight_hand )
-	{
-		VectorCopy( vr.hand_origin[VR_HAND_LEFT], src ); // kept out of walls
-		AngleVectors( vr.hand_angles[VR_HAND_LEFT], forward, NULL, NULL );
-	}
-	else
-	{
-		VectorCopy( vr.head_origin, src );
-		AngleVectors( vr.head_angles, forward, NULL, NULL );
-	}
+	VectorCopy( vr.head_origin, src );
+	AngleVectors( vr.head_angles, forward, NULL, NULL );
 
 	VectorMA( src, VR_FLASHLIGHT_DISTANCE, forward, end );
 	tr = CL_TraceLine( src, end, PM_STUDIO_BOX );
@@ -3203,7 +3191,7 @@ static void VR_Info_f( void )
 				vr.grab_model->name, shape ? shape->num_boxes : 0 );
 		}
 		if( vr.flashlight_on )
-			Con_Printf( "VR: flashlight on, from the %s, lighting %.1f %.1f %.1f\n", vr.flashlight_hand ? "left hand" : "head",
+			Con_Printf( "VR: flashlight on, lighting %.1f %.1f %.1f\n",
 				vr.flashlight_spot[0], vr.flashlight_spot[1], vr.flashlight_spot[2] );
 		else Con_Printf( "VR: flashlight off\n" );
 		if( VR_HeadlampZone( ))
@@ -3281,7 +3269,6 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_weaponcollide );
 	Cvar_RegisterVariable( &vr_grab_needgrip );
 	Cvar_RegisterVariable( &vr_debug_offhand );
-	Cvar_RegisterVariable( &vr_flashlight );
 	Cvar_RegisterVariable( &vr_hidearms );
 	Cvar_RegisterVariable( &vr_pinweapon );
 	Cvar_RegisterVariable( &vr_twosided );

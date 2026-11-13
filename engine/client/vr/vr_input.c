@@ -68,7 +68,7 @@ typedef enum
 	VR_ACT_USE,
 	VR_ACT_RELOAD,
 	VR_ACT_MENU,
-	VR_ACT_FLASHLIGHT, // off hand: toggles the flashlight (impulse 100)
+	VR_ACT_FLASHLIGHT, // a button that toggles the flashlight (impulse 100), besides the switch at the temple
 	VR_ACT_FINGER_TRIGGER, // float, per hand: how far the trigger is pulled, for the hand model
 	VR_ACT_FINGER_SQUEEZE, // float, per hand: how hard the grip is squeezed, for the hand model
 	VR_ACT_GRIP_POSE, // pose, per hand: where the hand holds things
@@ -612,8 +612,8 @@ void VR_PreCreateMove( float frametime )
 		vri.flashlight_pending = true;
 	vri.flashlight_was_down = vri.flashlight;
 
-	// the head flashlight (vr_flashlight 0) also switches like a headlamp:
-	// the left trigger pulled beside the left temple. The trigger is alt fire
+	// the flashlight is on the head and also switches like a headlamp: the
+	// left trigger pulled beside the left temple. The trigger is alt fire
 	// too, so alt fire waits while the hand is there or that pull is held.
 	{
 		qboolean at_lamp = VR_HeadlampZone( );
