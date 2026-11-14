@@ -107,7 +107,8 @@ void VR_UpdateReload( const model_t *weapon, const model_t *drawn, qboolean gun_
 qboolean VR_ReloadHolding( void ); // the left hand holds ammo, so it leaves the gun alone
 int VR_ReloadHandPose( void );     // the left hand's pose while it does
 qboolean VR_ManualReload( void );  // vr_manualreload: no reload button, no automatic reload
-void VR_ReloadCommand( usercmd_t *cmd ); // from VR_CreateMove: presses reload when the ammo went in
+void VR_ReloadCommand( usercmd_t *cmd ); // from VR_CreateMove: presses reload when the ammo went in, sends the eject
+void VR_ReloadEject( void );       // the reload button went down with vr_manualreload: drop the magazine
 void VR_AddHeldAmmo( const vec3_t origin, const vec3_t angles ); // after VR_AddHands
 void VR_ReloadInfo( void );        // for vr_info
 

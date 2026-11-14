@@ -21,6 +21,8 @@ GNU General Public License for more details.
 #include "vr_local.h"
 #include "entity_types.h"
 #include "const.h" // IN_ buttons
+#include "cl_tent.h"
+#include "r_efx.h" // FTENT_ flags
 
 // Reloading by hand: the left hand reaches over a shoulder and squeezes grip
 // to pull out ammo for the gun in the right hand (a haptic tick says the hand
@@ -30,7 +32,12 @@ GNU General Public License for more details.
 //
 // With vr_manualreload 1 (the default) the game doesn't reload on its own
 // when the clip runs dry, and the controller's reload button does nothing
-// (it's kept for the magazine eject). The game DLLs read vr_manualreload
+// drops the magazine instead: the engine sends the game VR_IMPULSE_EJECT
+// (210), which puts the clip's rounds back in the reserve, and drops the
+// ammo model from the magazine well with Half-Life's clip release sound.
+// With vr_ejectfirst 1, guns with a magazine (or the 357's cylinder) only
+// take ammo once they're empty, ejected or fired dry; the shotgun and the
+// RPG load whenever there's room. The game DLLs read vr_manualreload
 // themselves (VR_ReloadAllowed in hlsdk). vr_manualreload 0 brings back the
 // button and the automatic reload; the hand reload works in both.
 //
@@ -40,6 +47,7 @@ GNU General Public License for more details.
 // it with a "magwell <forward> <right> <up> <radius>" line in models/vr/v_X.txt.
 // The ammo in the hand is Half-Life's own pickup model, or ours from
 // models/vr/ under the same name. Everything is loaded with the map.
+static CVAR_DEFINE_AUTO( vr_ejectfirst, "1", FCVAR_ARCHIVE, "reloading by hand: guns with a magazine take ammo only once empty (eject with the reload button, or fire them dry); 0 = top up any time" );
 static CVAR_DEFINE_AUTO( vr_manualreload, "1", FCVAR_ARCHIVE, "reload by reaching over the shoulder for ammo and putting it in the gun; 0 = the reload button and automatic reloads (the hand reload still works)" );
 
 #define VR_SHOULDER_BACK    1.0f  // game units behind the head center the zone starts
@@ -49,12 +57,14 @@ static CVAR_DEFINE_AUTO( vr_manualreload, "1", FCVAR_ARCHIVE, "reload by reachin
 #define VR_RELOAD_LET_GO    0.4f  // ... below this drops it
 #define VR_RELOAD_PRESS     1.0f  // seconds reload is held at most, waiting for the game to start it
 #define VR_RELOAD_PRESS_BLIND 0.3f // ... when the game sends no weapon data (cl_lw 0)
+#define VR_IMPULSE_EJECT      210  // hlsdk weapons.h: the game drops the magazine
 
 typedef struct
 {
 	const char *viewmodel; // Half-Life's, the one the game sets
 	const char *ammo;      // in the hand
 	int         maxclip;   // the game's, so a full gun can't be reloaded
+	qboolean    magazine;  // has a magazine (or cylinder) the reload button drops
 	vec3_t      magwell;   // forward right up from the grip
 	float       radius;
 } vr_reload_weapon_t;
@@ -62,12 +72,12 @@ typedef struct
 // first guesses for Half-Life's models, to be tuned in the headset
 static const vr_reload_weapon_t vr_reload_weapons[] =
 {
-	{ "v_9mmhandgun.mdl", "w_9mmclip.mdl",       17, { -1.0f, 0.0f, -4.0f }, 4.0f }, // into the grip from below
-	{ "v_9mmAR.mdl",      "w_9mmARclip.mdl",     50, {  5.0f, 0.0f, -3.0f }, 4.0f }, // in front of the trigger guard
-	{ "v_357.mdl",        "w_357ammo.mdl",        6, {  3.0f, 0.0f,  2.0f }, 4.0f }, // the cylinder
-	{ "v_shotgun.mdl",    "w_shotshell.mdl",      8, {  8.0f, 0.0f, -2.0f }, 4.0f }, // the loading port underneath
-	{ "v_crossbow.mdl",   "w_crossbow_clip.mdl",  5, {  6.0f, 0.0f,  3.0f }, 5.0f }, // on top
-	{ "v_rpg.mdl",        "w_rpgammo.mdl",        1, { -6.0f, 0.0f,  2.0f }, 6.0f }, // the back of the tube
+	{ "v_9mmhandgun.mdl", "w_9mmclip.mdl",       17, true,  { -1.0f, 0.0f, -4.0f }, 4.0f }, // into the grip from below
+	{ "v_9mmAR.mdl",      "w_9mmARclip.mdl",     50, true,  {  5.0f, 0.0f, -3.0f }, 4.0f }, // in front of the trigger guard
+	{ "v_357.mdl",        "w_357ammo.mdl",        6, true,  {  3.0f, 0.0f,  2.0f }, 4.0f }, // the cylinder
+	{ "v_shotgun.mdl",    "w_shotshell.mdl",      8, false, {  8.0f, 0.0f, -2.0f }, 4.0f }, // the loading port underneath
+	{ "v_crossbow.mdl",   "w_crossbow_clip.mdl",  5, true,  {  6.0f, 0.0f,  3.0f }, 5.0f }, // on top
+	{ "v_rpg.mdl",        "w_rpgammo.mdl",        1, false, { -6.0f, 0.0f,  2.0f }, 6.0f }, // the back of the tube
 };
 
 static struct
@@ -85,11 +95,20 @@ static struct
 
 	// what vr_info reports
 	float         magwell_dist;
+
+	// the gun this frame, for the eject
+	int           gun_index;    // vr_reload_weapons entry, -1 = none or not usable
+	vec3_t        magwell_spot; // in the world
+	vec3_t        gun_up;
+	sound_t       eject_sound;
+	qboolean      eject_pending; // the button was pressed, waiting for a command without an impulse
 } vrr;
 
 void VR_ReloadInit( void )
 {
 	Cvar_RegisterVariable( &vr_manualreload );
+	Cvar_RegisterVariable( &vr_ejectfirst );
+	vrr.gun_index = -1;
 	vrr.seq_hold = VR_POSE_FIST;
 }
 
@@ -119,6 +138,10 @@ void VR_LoadReloadModels( void )
 		if( vrr.ammo[i] && vrr.ammo[i]->type != mod_studio )
 			vrr.ammo[i] = NULL;
 	}
+
+	vrr.eject_sound = S_RegisterSound( "items/cliprelease1.wav" ); // loaded with the map's sounds
+	vrr.gun_index = -1;
+	vrr.eject_pending = false;
 
 	vrr.seq_hold = VR_HandSequence( "hold_ammo" );
 	if( vrr.seq_hold < 0 )
@@ -166,6 +189,8 @@ static qboolean VR_ReloadNeeded( const vr_reload_weapon_t *w )
 		return true; // the game decides
 	if( wd->m_fInReload || wd->m_fInSpecialReload )
 		return false;
+	if( w->magazine && vr_ejectfirst.value && wd->m_iClip > 0 )
+		return false; // the magazine is still in
 	return reserve > 0 && wd->m_iClip >= 0 && wd->m_iClip < w->maxclip;
 }
 
@@ -205,13 +230,37 @@ void VR_UpdateReload( const model_t *weapon, const model_t *drawn, qboolean gun_
 	int index = VR_ReloadWeaponIndex( weapon );
 	const vr_reload_weapon_t *w = index >= 0 ? &vr_reload_weapons[index] : NULL;
 	float trigger, squeeze, radius;
-	vec3_t f, r, u, magwell, ofs, spot;
-	qboolean zone, usable;
+	vec3_t f, r, magwell, ofs;
+	qboolean zone;
 
 	vrr.magwell_dist = -1.0f;
+	vrr.gun_index = -1;
 
-	usable = w && gun_valid && off_valid && cls.state == ca_active && cls.key_dest == key_game && cl.local.health > 0;
-	if( !usable )
+	if( !w || !gun_valid || cls.state != ca_active || cls.key_dest != key_game || cl.local.health <= 0 )
+	{
+		vrr.holding = NULL;
+		vrr.in_zone = false;
+		vrr.squeeze_down = true;
+		return;
+	}
+
+	// the gun's magazine well this frame, for the eject and the insert
+	VectorCopy( w->magwell, magwell );
+	radius = w->radius;
+	if(( shape = VR_WeaponShape( drawn )) && shape->has_magwell )
+	{
+		VectorCopy( shape->magwell, magwell );
+		radius = shape->magwell_radius;
+	}
+
+	AngleVectors( gun_angles, f, r, vrr.gun_up );
+	VectorScale( f, magwell[0], ofs );
+	VectorMA( ofs, magwell[1], r, ofs );
+	VectorMA( ofs, magwell[2], vrr.gun_up, ofs );
+	VectorAdd( gun_origin, ofs, vrr.magwell_spot );
+	vrr.gun_index = index;
+
+	if( !off_valid )
 	{
 		vrr.holding = NULL;
 		vrr.in_zone = false;
@@ -246,21 +295,7 @@ void VR_UpdateReload( const model_t *weapon, const model_t *drawn, qboolean gun_
 		return;
 
 	// to the magazine well
-	VectorCopy( w->magwell, magwell );
-	radius = w->radius;
-	if(( shape = VR_WeaponShape( drawn )) && shape->has_magwell )
-	{
-		VectorCopy( shape->magwell, magwell );
-		radius = shape->magwell_radius;
-	}
-
-	AngleVectors( gun_angles, f, r, u );
-	VectorScale( f, magwell[0], ofs );
-	VectorMA( ofs, magwell[1], r, ofs );
-	VectorMA( ofs, magwell[2], u, ofs );
-	VectorAdd( gun_origin, ofs, spot );
-
-	vrr.magwell_dist = VectorDistance( off_tracked, spot );
+	vrr.magwell_dist = VectorDistance( off_tracked, vrr.magwell_spot );
 	if( vrr.magwell_dist < radius )
 	{
 		vrr.holding = NULL;
@@ -270,6 +305,50 @@ void VR_UpdateReload( const model_t *weapon, const model_t *drawn, qboolean gun_
 		VR_Haptic( VR_HAND_RIGHT, 0.08f, 0.8f );
 		Con_Reportf( "VR: ammo in %s, reloading\n", weapon->name );
 	}
+}
+
+/*
+VR_ReloadEject
+
+From VR_CreateMove when the reload button goes down with vr_manualreload
+on. For a gun with a magazine that has rounds in it (or no weapon data to
+tell): drops the ammo model from the magazine well with the clip release
+sound, buzzes the gun hand, and asks for the game's eject impulse, which
+VR_ReloadCommand puts in the next command without one.
+*/
+void VR_ReloadEject( void )
+{
+	const vr_reload_weapon_t *w;
+	const weapon_data_t *wd;
+	model_t *mod;
+	TEMPENTITY *te;
+	int reserve;
+
+	if( vrr.gun_index < 0 || !( w = &vr_reload_weapons[vrr.gun_index] )->magazine )
+		return;
+	if( VR_GunState( &wd, &reserve ) && ( wd->m_iClip <= 0 || wd->m_fInReload || wd->m_fInSpecialReload ))
+		return; // nothing in it, or a reload under way
+
+	vrr.eject_pending = true;
+	VR_Haptic( VR_HAND_RIGHT, 0.04f, 0.5f );
+
+	if( vrr.eject_sound >= 0 )
+		S_StartSound( vrr.magwell_spot, 0, CHAN_AUTO, vrr.eject_sound, VOL_NORM, ATTN_NORM, PITCH_NORM, 0 );
+
+	// the magazine falls out of the well and fades on the floor; tempents
+	// come from a fixed pool, nothing is allocated
+	te = NULL;
+	if(( mod = vrr.ammo[vrr.gun_index] ) && ( te = CL_TempEntAlloc( vrr.magwell_spot, mod )))
+	{
+		VectorScale( vrr.gun_up, -60.0f, te->entity.baseline.origin ); // out the bottom, then gravity
+		VectorAdd( te->entity.baseline.origin, cl.simvel, te->entity.baseline.origin );
+		te->flags = FTENT_COLLIDEWORLD|FTENT_GRAVITY|FTENT_FADEOUT;
+		te->fadeSpeed = 1.0f;
+		te->entity.baseline.renderamt = te->entity.curstate.renderamt = 255;
+		te->die = cl.time + 3.0f;
+	}
+
+	Con_Reportf( "VR: magazine dropped from %s%s\n", w->viewmodel, te ? "" : " (no model to drop)" );
 }
 
 qboolean VR_ReloadHolding( void )
@@ -293,6 +372,13 @@ void VR_ReloadCommand( usercmd_t *cmd )
 {
 	const weapon_data_t *wd;
 	int reserve;
+
+	// the eject waits for a command without an impulse (the flashlight's)
+	if( vrr.eject_pending && !cmd->impulse )
+	{
+		cmd->impulse = VR_IMPULSE_EJECT;
+		vrr.eject_pending = false;
+	}
 
 	if( host.realtime >= vrr.press_until )
 		return;

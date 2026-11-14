@@ -199,12 +199,19 @@ static struct
 	qboolean     snap_armed; // the turn stick went back to center since the last snap
 	qboolean     flick_armed; // same for weapon flicks
 	qboolean     crouch_was_down;
+	qboolean     reload_was_down; // the reload button, for the magazine eject
 	qboolean     crouch_latched; // vr_crouchtoggle: ducked by the button
 	qboolean     crouch_debug_press; // vr_debug_crouchpress
+	qboolean     reload_debug_press; // vr_debug_reloadpress
 	qboolean     jump_ducking; // vr_autocrouch: a jump is under way
 	qboolean     jump_left_ground; // ... and the player has left the ground
 	double       jump_time;
 } vri;
+
+static void VR_DebugReloadPress_f( void )
+{
+	vri.reload_debug_press = true;
+}
 
 static void VR_DebugCrouchPress_f( void )
 {
@@ -291,6 +298,7 @@ qboolean VR_InitInput( void )
 	Cvar_RegisterVariable( &vr_crouchtoggle );
 	Cvar_RegisterVariable( &vr_autocrouch );
 	Cmd_AddCommand( "vr_debug_crouchpress", VR_DebugCrouchPress_f, "developer: press the crouch button once, to test without controllers" );
+	Cmd_AddCommand( "vr_debug_reloadpress", VR_DebugReloadPress_f, "developer: press the reload button once (the magazine eject), to test without controllers" );
 	Cvar_RegisterVariable( &vr_debug_sticks );
 	Cvar_RegisterVariable( &vr_debug_hands );
 	Cvar_RegisterVariable( &vr_debug_fingers );
@@ -807,9 +815,20 @@ void VR_CreateMove( usercmd_t *cmd )
 	{
 		int buttons = VR_CrouchButtons( cmd->buttons );
 
-		// with reloading by hand the reload button waits for the magazine eject
+		// with reloading by hand the reload button drops the magazine
+		if( vri.reload_debug_press )
+		{
+			SetBits( buttons, IN_RELOAD );
+			vri.reload_debug_press = false;
+		}
+
 		if( VR_ManualReload( ))
+		{
+			if( FBitSet( buttons, IN_RELOAD ) && !vri.reload_was_down && cls.key_dest == key_game )
+				VR_ReloadEject( );
+			vri.reload_was_down = FBitSet( buttons, IN_RELOAD ) != 0;
 			ClearBits( buttons, IN_RELOAD );
+		}
 		cmd->buttons |= buttons;
 	}
 
