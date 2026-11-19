@@ -76,6 +76,11 @@ void VR_CreateMove( struct usercmd_s *cmd );
 // raw 32-bit slots reserved[1..3]; the game DLLs see the same memory as floats
 #define VR_CMD_ROOMMOVE( cmd ) ((float *)&( cmd )->reserved[1] )
 
+// ... and Half-Life's impact_index as reserved[0]: VR flags for pm_shared
+// (networked in 6 bits, see delta.lst; keep the hlsdk side in step)
+#define VR_CMD_FLAGS( cmd ) (( cmd )->reserved[0] )
+#define VR_CMDF_INSTANTDUCK 1 // finish a duck on the ground at once, no 0.4 s TIME_TO_DUCK
+
 // called by the renderer's buffer swap, before the desktop window swaps:
 // if the eyes weren't rendered this frame (menus, loading), copies the
 // finished desktop frame into them so 2D screens stay visible

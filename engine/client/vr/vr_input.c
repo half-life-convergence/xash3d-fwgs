@@ -44,6 +44,7 @@ static CVAR_DEFINE_AUTO( vr_turnspeed, "120", FCVAR_ARCHIVE, "smooth turning spe
 static CVAR_DEFINE_AUTO( vr_movespeed, "4", FCVAR_ARCHIVE, "stick movement speed at full tilt in metres per second (the original game runs at ~8); 0 = the original full speed" );
 static CVAR_DEFINE_AUTO( vr_autocrouch, "1", FCVAR_ARCHIVE, "jumping ducks the player until landing, like a crouch jump, so ledges and vents need only the jump button" );
 static CVAR_DEFINE_AUTO( vr_crouchtoggle, "1", FCVAR_ARCHIVE, "the crouch button: 1 = press to toggle ducking, 0 = hold to duck" );
+static CVAR_DEFINE_AUTO( vr_instantduck, "1", FCVAR_ARCHIVE, "ducking on the ground: 1 = at once, 0 = the original 0.4 s" );
 static CVAR_DEFINE_AUTO( vr_movedir, "0", FCVAR_ARCHIVE, "the move stick goes where: 0 = the head looks, 1 = the left hand points" );
 static CVAR_DEFINE_AUTO( vr_debug_sticks, "0 0 0 0", 0, "developer: pretend the sticks are at \"left_x left_y right_x right_y\", to test without controllers" );
 static CVAR_DEFINE_AUTO( vr_debug_fingers, "0 0 0 0", 0, "developer: pretend the triggers and grips are at \"left_trigger left_grip right_trigger right_grip\" (0 to 1), to test the hand poses without controllers" );
@@ -301,6 +302,7 @@ qboolean VR_InitInput( void )
 	Cvar_RegisterVariable( &vr_movespeed );
 	Cvar_RegisterVariable( &vr_movedir );
 	Cvar_RegisterVariable( &vr_crouchtoggle );
+	Cvar_RegisterVariable( &vr_instantduck );
 	Cvar_RegisterVariable( &vr_autocrouch );
 	Cmd_AddCommand( "vr_debug_crouchpress", VR_DebugCrouchPress_f, "developer: press the crouch button once, to test without controllers" );
 	Cmd_AddCommand( "vr_debug_reloadpress", VR_DebugReloadPress_f, "developer: press the reload button once (the magazine eject), to test without controllers" );
@@ -864,6 +866,10 @@ void VR_CreateMove( usercmd_t *cmd )
 		}
 		cmd->buttons |= buttons;
 	}
+
+	// pm_shared ducks at once for this command, see PM_Duck
+	if( vr_instantduck.value )
+		SetBits( VR_CMD_FLAGS( cmd ), VR_CMDF_INSTANTDUCK );
 
 	// the ammo just went in: press reload for the game
 	VR_ReloadCommand( cmd );
