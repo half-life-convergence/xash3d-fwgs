@@ -212,6 +212,7 @@ static struct
 	qboolean     jump_ducking; // vr_autocrouch: a jump is under way
 	qboolean     jump_left_ground; // ... and the player has left the ground
 	double       jump_time;
+	float        aim_yaw_offset; // last command: the hand's aim yaw minus the body yaw, see VR_SetAngles
 } vri;
 
 static void VR_DebugReloadPress_f( void )
@@ -729,11 +730,13 @@ static void VR_AimFromHand( usercmd_t *cmd )
 	if( !VR_RightHandAim( origin, angles ))
 	{
 		VR_SetAimCvar( &vr_aim_active, 0.0f );
+		vri.aim_yaw_offset = 0.0f;
 		return;
 	}
 
 	old_yaw = cmd->viewangles[YAW];
 	new_yaw = angles[YAW];
+	vri.aim_yaw_offset = anglemod( new_yaw - old_yaw + 180.0f ) - 180.0f; // -180 to 180
 
 	// same world direction, expressed in the new yaw: rotate (forward, right)
 	// by the yaw difference (yaw grows to the left, right is -left)
@@ -914,6 +917,28 @@ void VR_CreateMove( usercmd_t *cmd )
 
 	// last: it turns all of the command's movement, keyboard included
 	VR_AimFromHand( cmd );
+}
+
+/*
+VR_SetAngles
+
+The server set the view angles: a level change or a loaded save restores
+the player's v_angle, a respawn or a teleport picks new ones. In VR
+v_angle is the right hand's aim (VR_AimFromHand), not the body, so the
+body would turn to wherever the hand pointed, and the world with it.
+Take the last command's offset between the two off again, so the hand
+keeps pointing that way and the body faces as before. Pitch and roll come
+from the headset alone, so they're cleared.
+*/
+void VR_SetAngles( float *viewangles )
+{
+	if( !vri.initialized || !VR_Active( ))
+		return;
+
+	viewangles[YAW] = anglemod( viewangles[YAW] - vri.aim_yaw_offset );
+	viewangles[PITCH] = 0.0f;
+	viewangles[ROLL] = 0.0f;
+	Con_Reportf( "VR: server set the yaw, body turned by %.1f to %.1f (hand aim offset)\n", -vri.aim_yaw_offset, viewangles[YAW] );
 }
 
 #endif // XASH_OPENXR

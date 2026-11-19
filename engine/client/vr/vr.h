@@ -72,6 +72,11 @@ void VR_RoomApplied( const float *moved );
 void VR_PreCreateMove( float frametime );
 void VR_CreateMove( struct usercmd_s *cmd );
 
+// called by CL_ParseSetAngle after the server set cl.viewangles: in VR the
+// commands carry the right hand's aim, so the server's angles (a level
+// change restores v_angle) are the hand's; turns them back into the body's
+void VR_SetAngles( float *viewangles );
+
 // the engine's usercmd_t keeps Half-Life's impact_position[3] floats as
 // raw 32-bit slots reserved[1..3]; the game DLLs see the same memory as floats
 #define VR_CMD_ROOMMOVE( cmd ) ((float *)&( cmd )->reserved[1] )

@@ -1244,6 +1244,9 @@ set the view angle to this absolute value
 static void CL_ParseSetAngle( sizebuf_t *msg )
 {
 	MSG_ReadVec3Angles( msg, cl.viewangles );
+#if XASH_OPENXR
+	VR_SetAngles( cl.viewangles ); // the server's angles are the hand's aim in VR
+#endif
 }
 
 /*
