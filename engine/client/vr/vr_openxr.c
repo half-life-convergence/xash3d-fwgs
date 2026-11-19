@@ -1313,6 +1313,15 @@ void VR_RoomRequest( usercmd_t *cmd )
 	if( len > VR_ROOM_MAX_STEP )
 		VectorScale( step, VR_ROOM_MAX_STEP / len, step );
 
+	// the netcode sends 1/8 units, cut toward zero (delta.lst, multiplier 8),
+	// while the client predicts with this copy: send exactly what the server
+	// gets, or tracking noise makes them disagree and the corrections jitter
+	// the player while standing still. What's cut off stays in the gap.
+	step[0] = (int)( step[0] * 8.0f ) / 8.0f;
+	step[1] = (int)( step[1] * 8.0f ) / 8.0f;
+	if( step[0] == 0.0f && step[1] == 0.0f )
+		return;
+
 	VR_CMD_ROOMMOVE( cmd )[0] = step[0];
 	VR_CMD_ROOMMOVE( cmd )[1] = step[1];
 	VR_CMD_ROOMMOVE( cmd )[2] = 0.0f;

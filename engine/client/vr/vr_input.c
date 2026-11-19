@@ -917,6 +917,14 @@ void VR_CreateMove( usercmd_t *cmd )
 
 	// last: it turns all of the command's movement, keyboard included
 	VR_AimFromHand( cmd );
+
+	// the netcode sends these as whole units, cut toward zero (delta.lst,
+	// 12 bits, multiplier 1), but the client predicts with what's here. Send
+	// the same value both ways, or the server ends up somewhere else than
+	// predicted, and every correction moves the player.
+	cmd->forwardmove = (int)cmd->forwardmove;
+	cmd->sidemove = (int)cmd->sidemove;
+	cmd->upmove = (int)cmd->upmove;
 }
 
 /*
