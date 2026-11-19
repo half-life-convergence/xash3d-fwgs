@@ -61,7 +61,7 @@ static CVAR_DEFINE_AUTO( vr_aim_z, "0", 0, "VR: gun start point relative to the 
 typedef enum
 {
 	VR_ACT_MOVE = 0, // vector2f
-	VR_ACT_TURN, // vector2f: x turns, y flicks through weapons
+	VR_ACT_TURN, // vector2f: x turns, flicking y down crouches and up stands
 	VR_ACT_FIRE,
 	VR_ACT_ALTFIRE,
 	VR_ACT_JUMP,
@@ -69,6 +69,7 @@ typedef enum
 	VR_ACT_USE,
 	VR_ACT_RELOAD,
 	VR_ACT_MENU,
+	VR_ACT_NEXTWEAPON,
 	VR_ACT_FINGER_TRIGGER, // float, per hand: how far the trigger is pulled, for the hand model
 	VR_ACT_FINGER_SQUEEZE, // float, per hand: how hard the grip is squeezed, for the hand model
 	VR_ACT_GRIP_POSE, // pose, per hand: where the hand holds things
@@ -88,7 +89,7 @@ typedef struct
 static const vr_action_def_t vr_action_defs[VR_ACT_COUNT] =
 {
 	{ "move", "Move", XR_ACTION_TYPE_VECTOR2F_INPUT, 0 },
-	{ "turn", "Turn / weapon select", XR_ACTION_TYPE_VECTOR2F_INPUT, 0 },
+	{ "turn", "Turn / crouch (down) / stand (up)", XR_ACTION_TYPE_VECTOR2F_INPUT, 0 },
 	{ "fire", "Fire", XR_ACTION_TYPE_BOOLEAN_INPUT, IN_ATTACK },
 	{ "altfire", "Alt fire", XR_ACTION_TYPE_BOOLEAN_INPUT, IN_ATTACK2 },
 	{ "jump", "Jump", XR_ACTION_TYPE_BOOLEAN_INPUT, IN_JUMP },
@@ -96,6 +97,7 @@ static const vr_action_def_t vr_action_defs[VR_ACT_COUNT] =
 	{ "use", "Use", XR_ACTION_TYPE_BOOLEAN_INPUT, IN_USE },
 	{ "reload", "Reload", XR_ACTION_TYPE_BOOLEAN_INPUT, IN_RELOAD },
 	{ "menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT, 0 },
+	{ "next_weapon", "Next weapon", XR_ACTION_TYPE_BOOLEAN_INPUT, 0 },
 	{ "finger_trigger", "Index finger (hand pose)", XR_ACTION_TYPE_FLOAT_INPUT, 0 },
 	{ "finger_squeeze", "Hand closing (hand pose)", XR_ACTION_TYPE_FLOAT_INPUT, 0 },
 	{ "hand_grip", "Hand grip pose", XR_ACTION_TYPE_POSE_INPUT, 0 },
@@ -138,7 +140,7 @@ static const vr_binding_t vr_bindings_index[] =
 	{ VR_ACT_JUMP, "/user/hand/right/input/a/click" },
 	{ VR_ACT_RELOAD, "/user/hand/right/input/b/click" },
 	{ VR_ACT_USE, "/user/hand/left/input/a/click" },
-	{ VR_ACT_CROUCH, "/user/hand/left/input/b/click" },
+	{ VR_ACT_NEXTWEAPON, "/user/hand/left/input/b/click" }, // crouch is on the right stick
 	{ VR_ACT_MENU, "/user/hand/left/input/thumbstick/click" },
 };
 
@@ -153,7 +155,7 @@ static const vr_binding_t vr_bindings_touch[] =
 	{ VR_ACT_JUMP, "/user/hand/right/input/a/click" },
 	{ VR_ACT_RELOAD, "/user/hand/right/input/b/click" },
 	{ VR_ACT_USE, "/user/hand/left/input/x/click" },
-	{ VR_ACT_CROUCH, "/user/hand/left/input/y/click" },
+	{ VR_ACT_NEXTWEAPON, "/user/hand/left/input/y/click" }, // crouch is on the right stick
 	{ VR_ACT_MENU, "/user/hand/left/input/menu/click" },
 };
 
@@ -188,16 +190,19 @@ static struct
 	// this frame's state, read by VR_PreCreateMove
 	int          buttons; // IN_ bits held
 	qboolean     menu;
+	qboolean     nextweapon;
 	XrVector2f   move;
 	XrVector2f   turn;
 	float        fingers[2][2]; // [left, right][trigger, squeeze], 0 to 1
 
 	// edge tracking
 	qboolean     menu_was_down;
+	qboolean     nextweapon_was_down;
 	qboolean     flashlight_pending; // switched at the temple, VR_CreateMove sends impulse 100
 	qboolean     headlamp_pull; // the left trigger was pulled at the head flashlight's switch and is still held
 	qboolean     snap_armed; // the turn stick went back to center since the last snap
-	qboolean     flick_armed; // same for weapon flicks
+	qboolean     flick_armed; // same for the crouch/stand flicks
+	int          crouch_flick; // the turn stick was flicked: 1 = down (crouch), -1 = up (stand), 0 = none yet
 	qboolean     crouch_was_down;
 	qboolean     reload_was_down; // the reload button, for the magazine eject
 	qboolean     crouch_latched; // vr_crouchtoggle: ducked by the button
@@ -550,6 +555,7 @@ static void VR_ReadActions( void )
 
 	vri.buttons = 0;
 	vri.menu = false;
+	vri.nextweapon = false;
 	vri.move.x = vri.move.y = vri.turn.x = vri.turn.y = 0.0f;
 	memset( vri.fingers, 0, sizeof( vri.fingers ));
 
@@ -570,6 +576,7 @@ static void VR_ReadActions( void )
 			}
 
 			vri.menu = VR_Bool( VR_ACT_MENU );
+			vri.nextweapon = VR_Bool( VR_ACT_NEXTWEAPON );
 			vri.move = VR_Vector( VR_ACT_MOVE );
 			vri.turn = VR_Vector( VR_ACT_TURN );
 
@@ -606,7 +613,8 @@ VR_PreCreateMove
 
 Before the client builds the command: read the controllers, then turn the
 view (the client reads cl.viewangles in CL_CreateMove) and handle the
-one-shot inputs, weapon flicks and the menu button.
+one-shot inputs, the crouch/stand flicks, weapon switching and the menu
+button.
 */
 void VR_PreCreateMove( float frametime )
 {
@@ -621,6 +629,11 @@ void VR_PreCreateMove( float frametime )
 	if( vri.menu && !vri.menu_was_down )
 		Cbuf_AddText( "togglemenu\n" );
 	vri.menu_was_down = vri.menu;
+
+	// next weapon on press (the HUD's weapon menu, fire picks)
+	if( vri.nextweapon && !vri.nextweapon_was_down && cls.key_dest == key_game )
+		Cbuf_AddText( "invnext\n" );
+	vri.nextweapon_was_down = vri.nextweapon;
 
 	// the flashlight is on the head and switches like a headlamp: the left
 	// trigger pulled beside the left temple, in the game only. VR_CreateMove
@@ -664,11 +677,13 @@ void VR_PreCreateMove( float frametime )
 	}
 	cl.viewangles[YAW] = anglemod( cl.viewangles[YAW] );
 
-	// flick the turn stick up or down to change weapons, only when it's
-	// clearly vertical so a diagonal turn doesn't switch weapons too
+	// flick the turn stick down to crouch and up to stand, only when it's
+	// clearly vertical so a diagonal turn doesn't crouch too.
+	// VR_CrouchButtons applies it to the latched duck.
 	if( vri.flick_armed && fabsf( vri.turn.y ) > 0.7f && fabsf( vri.turn.y ) > 2.0f * fabsf( vri.turn.x ))
 	{
-		Cbuf_AddText( vri.turn.y > 0.0f ? "invprev\n" : "invnext\n" );
+		if( cls.key_dest == key_game )
+			vri.crouch_flick = vri.turn.y < 0.0f ? 1 : -1;
 		vri.flick_armed = false;
 	}
 	else if( fabsf( vri.turn.y ) < 0.3f )
@@ -760,8 +775,24 @@ static int VR_CrouchButtons( int cmdbuttons )
 	vri.crouch_debug_press = false;
 
 	if( cls.state != ca_active || cl.local.health <= 0 )
+	{
 		vri.crouch_latched = false; // dead, loading: start the next life standing
+		vri.crouch_flick = 0;
+	}
 
+	// the right stick: down crouches, up stands, in both button modes
+	if( vri.crouch_flick )
+	{
+		qboolean duck = vri.crouch_flick > 0;
+
+		if( duck != vri.crouch_latched )
+			Con_Reportf( "VR: crouch %s\n", duck ? "on" : "off" );
+		vri.crouch_latched = duck;
+		vri.crouch_flick = 0;
+	}
+
+	// the crouch button (unbound by default, SteamVR can bind it): toggles
+	// the latched duck with vr_crouchtoggle, otherwise ducks while held
 	if( vr_crouchtoggle.value )
 	{
 		ClearBits( buttons, IN_DUCK );
@@ -770,10 +801,12 @@ static int VR_CrouchButtons( int cmdbuttons )
 			vri.crouch_latched = !vri.crouch_latched;
 			Con_Reportf( "VR: crouch %s\n", vri.crouch_latched ? "on" : "off" );
 		}
-		if( vri.crouch_latched )
-			SetBits( buttons, IN_DUCK );
 	}
-	else vri.crouch_latched = false;
+	else if( down )
+		SetBits( buttons, IN_DUCK );
+
+	if( vri.crouch_latched )
+		SetBits( buttons, IN_DUCK );
 
 	vri.crouch_was_down = down;
 
