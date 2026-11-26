@@ -40,6 +40,11 @@ void VR_EndFrame( void );
 // SteamVR doesn't throttle xrWaitFrame for frames without layers.
 qboolean VR_PacesFrames( void );
 
+// called by Host_Main with the wall-clock frame time: what the game should
+// step by instead, the time between this frame's and the last frame's
+// predicted display times when the headset paces the frames
+double VR_FrameTime( double wall );
+
 // called by Host_RunFrame while a changelevel is queued: true holds it
 // back for this frame, so the eyes can fade to black before the engine
 // blocks in the load (vr_levelfade)

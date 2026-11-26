@@ -1369,7 +1369,11 @@ int EXPORT Host_Main( int argc, char **argv, const char *progname, int bChangeGa
 		VR_WaitFrame(); // blocks until the headset wants a frame, before timing it
 #endif
 		double newtime = Platform_DoubleTime();
+#if XASH_OPENXR && !XASH_DEDICATED
+		COM_Frame( VR_FrameTime( newtime - oldtime )); // even steps, see VR_FrameTime
+#else
 		COM_Frame( newtime - oldtime );
+#endif
 		oldtime = newtime;
 #if XASH_OPENXR && !XASH_DEDICATED
 		VR_EndFrame();

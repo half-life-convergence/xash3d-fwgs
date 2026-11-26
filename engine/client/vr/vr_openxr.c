@@ -254,6 +254,14 @@ static struct
 	double   wait_total; // seconds spent blocked in xrWaitFrame
 	double   wait_max;
 	qboolean warned_wait; // print a failing xrWaitFrame only once
+
+	// game time steps by display time, see VR_FrameTime
+	XrTime   prev_display_time; // last frame's predicted display time, 0 = none
+	double   frame_step; // seconds between this frame's display time and the last one's
+	qboolean frame_step_valid; // ... set by this frame's xrWaitFrame
+	double   step_jitter_total; // how far the wall clock's step was from frame_step, summed
+	double   step_jitter_max;
+	uint32_t step_frames; // frames those two cover
 } vr;
 
 // Half-Life units are close to inches: the player is 72 units tall and
@@ -282,6 +290,7 @@ static CVAR_DEFINE_AUTO( vr_twohanded, "1", FCVAR_ARCHIVE, "while the off hand h
 static CVAR_DEFINE_AUTO( vr_debug_offhand, "", 0, "developer: with vr_debug_hands, put the left hand at \"forward right up\" game units from the right hand, in the gun's axes" );
 static CVAR_DEFINE_AUTO( vr_weapon_length, "12", FCVAR_ARCHIVE, "for weapon models without a muzzle point that aren't in the built-in table: how far they reach past the hand along the aim, game units" );
 static CVAR_DEFINE_AUTO( vr_loadfade, "0.5", FCVAR_ARCHIVE, "seconds the view takes to fade in after loading, 0 = no fade" );
+static CVAR_DEFINE_AUTO( vr_displaytime, "1", FCVAR_ARCHIVE, "game time steps by the headset's display times (even motion), 0 = by the wall clock after xrWaitFrame returns" );
 static CVAR_DEFINE_AUTO( vr_levelfade, "0.4", FCVAR_ARCHIVE, "seconds the view takes to fade out before a level change (the game keeps running meanwhile), 0 = cut straight to the loading panel" );
 static CVAR_DEFINE_AUTO( vr_debug_unfocused, "0", 0, "developer: act as if the headset lost focus (headset off, system menu open), to test pausing without a headset" );
 
@@ -2936,6 +2945,9 @@ static void VR_PrintFrameStats( void )
 	Con_Printf( "VR: eyes rendered in %u frames, desktop copy in %u, empty %u\n",
 		vr.frames_rendered, vr.frames_copied, vr.frames - vr.frames_rendered - vr.frames_copied );
 	Con_Printf( "VR: loading panel submitted in %u frames\n", vr.frames_panel );
+	Con_Printf( "VR: game time steps by %s; the wall clock was off by %.2f ms per frame on average, %.2f ms at most\n",
+		vr_displaytime.value ? "display time" : "the wall clock",
+		vr.step_frames ? vr.step_jitter_total * 1000.0 / vr.step_frames : 0.0, vr.step_jitter_max * 1000.0 );
 }
 
 // the desktop mirror window must not wait for vsync while VR runs, the
@@ -2973,6 +2985,9 @@ static void VR_BeginSession( void )
 	vr.running = true;
 	vr.frames = vr.frames_rendered = vr.frames_copied = vr.frames_panel = 0;
 	vr.wait_total = vr.wait_max = 0.0;
+	vr.step_jitter_total = vr.step_jitter_max = 0.0;
+	vr.step_frames = 0;
+	vr.prev_display_time = 0;
 	vr.begin_time = Platform_DoubleTime();
 	Con_Printf( "VR: session running\n" );
 }
@@ -3325,6 +3340,8 @@ void VR_WaitFrame( void )
 
 	VR_UpdatePacing( );
 
+	vr.frame_step_valid = false;
+
 	if( !vr.running )
 		return;
 
@@ -3369,6 +3386,15 @@ void VR_WaitFrame( void )
 	vr.display_period = state.predictedDisplayPeriod;
 	vr.should_render = state.shouldRender;
 
+	// the time between the images the player sees, for VR_FrameTime; a long
+	// gap (a blocking load, a pause) falls back to the wall clock
+	if( vr.prev_display_time > 0 && vr.display_time > vr.prev_display_time )
+	{
+		vr.frame_step = ( vr.display_time - vr.prev_display_time ) / 1e9;
+		vr.frame_step_valid = vr.frame_step < 0.1;
+	}
+	vr.prev_display_time = vr.display_time;
+
 	// XR_FRAME_DISCARDED is a success code, the frame must still be ended
 	result = pxrBeginFrame( vr.session, &begin_info );
 	if( XR_FAILED( result ))
@@ -3385,6 +3411,36 @@ void VR_WaitFrame( void )
 void VR_EndFrame( void )
 {
 	VR_SubmitFrame( );
+}
+
+/*
+VR_FrameTime
+
+How far the game moves on this frame. xrWaitFrame returns a few ms
+earlier or later from frame to frame, so the wall clock measured after it
+gives uneven steps (9 ms, then 13 ms...), while the headset shows the
+frames exactly a display period apart: moving things then speed up and
+slow down a little, a micro stutter with no late frame. Stepping by the
+difference between the predicted display times moves the game exactly as
+far as the time between the images. A dropped frame shows up as a double
+step there too. Falls back to the wall clock when there's no display time
+(no session, a long gap) or vr_displaytime is 0.
+*/
+double VR_FrameTime( double wall )
+{
+	double off;
+
+	// without submitted layers SteamVR doesn't block, so the loop doesn't
+	// run at the display rate and the display times say nothing about it
+	if( !vr.frame_step_valid || !VR_PacesFrames( ))
+		return wall;
+
+	off = fabs( wall - vr.frame_step );
+	vr.step_jitter_total += off;
+	vr.step_jitter_max = Q_max( vr.step_jitter_max, off );
+	vr.step_frames++;
+
+	return vr_displaytime.value ? vr.frame_step : wall;
 }
 
 qboolean VR_PacesFrames( void )
@@ -3564,6 +3620,7 @@ void VR_Init( void )
 	Cvar_RegisterVariable( &vr_weapon_length );
 	Cvar_RegisterVariable( &vr_loadfade );
 	Cvar_RegisterVariable( &vr_levelfade );
+	Cvar_RegisterVariable( &vr_displaytime );
 	Cvar_RegisterVariable( &vr_debug_unfocused );
 	Cmd_AddCommand( "vr_recenter", VR_Recenter_f, "put the player back under the real head" );
 	Cmd_AddCommand( "vr_calibrate", VR_Calibrate_f, "stand or sit normally and run it: sets vr_heightoffset so your head is at the game's eye height" );
