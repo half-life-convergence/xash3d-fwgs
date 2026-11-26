@@ -366,6 +366,7 @@ void VR_LoadModels( void )
 	VR_LoadHandModel( );
 	VR_ResolveGrabPoses( );
 	VR_LoadReloadModels( );
+	VR_LoadMenuAssets( );
 }
 
 const vr_weapon_shape_t *VR_WeaponShape( const model_t *vrmodel )

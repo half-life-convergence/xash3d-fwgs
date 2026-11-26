@@ -628,10 +628,20 @@ void VR_PreCreateMove( float frametime )
 
 	VR_ReadActions( );
 
-	// menu toggles on press
+	// menu on press: the VR pause menu in a game, Half-Life's 2D menu elsewhere
 	if( vri.menu && !vri.menu_was_down )
-		Cbuf_AddText( "togglemenu\n" );
+		VR_MenuButton( );
 	vri.menu_was_down = vri.menu;
+
+	// the pause menu takes the right hand and the trigger; while it's up
+	// nothing else of the game reacts to the controllers
+	VR_MenuUpdate( );
+	if( VR_MenuOpen( ))
+	{
+		vri.nextweapon_was_down = vri.nextweapon;
+		vri.crouch_flick = 0;
+		return;
+	}
 
 	// next weapon on press (the HUD's weapon menu, fire picks)
 	if( vri.nextweapon && !vri.nextweapon_was_down && cls.key_dest == key_game )
@@ -850,6 +860,17 @@ void VR_CreateMove( usercmd_t *cmd )
 	if( !vri.initialized || !VR_Active( ))
 		return;
 
+	// the pause menu is up: the game is paused, send nothing that would
+	// act once it runs again
+	if( VR_MenuOpen( ))
+	{
+		cmd->buttons = 0;
+		cmd->impulse = 0;
+		cmd->forwardmove = cmd->sidemove = cmd->upmove = 0.0f;
+		VR_AimFromHand( cmd );
+		return;
+	}
+
 	{
 		int buttons = VR_CrouchButtons( cmd->buttons );
 
@@ -868,6 +889,10 @@ void VR_CreateMove( usercmd_t *cmd )
 			ClearBits( buttons, IN_RELOAD );
 		}
 		cmd->buttons |= buttons;
+
+		// the trigger that clicked in the menu doesn't shoot as it closes
+		if( VR_MenuHoldsFire( ))
+			ClearBits( cmd->buttons, IN_ATTACK );
 	}
 
 	// pm_shared ducks at once for this command, see PM_Duck

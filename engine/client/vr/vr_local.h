@@ -46,6 +46,26 @@ qboolean VR_HandYaw( int hand, float *yaw ); // degrees, where a hand points in 
 qboolean VR_PhysicalCrouch( void ); // the real head is below vr_crouchheight
 qboolean VR_HeadlampZone( void ); // the left controller is beside the left temple, where the trigger switches the flashlight
 qboolean VR_RightHandAim( vec3_t origin, vec3_t angles ); // the weapon hand in the world (grip position, aim angles in view convention), false if not tracked or vr_handweapon 0
+qboolean VR_HandAimPose( int hand, XrPosef *out ); // a hand's aim pose in the play space at this frame's display time, false if not tracked
+void VR_PoseAhead( float distance, float drop, XrPosef *out ); // level, distance metres in front of where the head faces, drop metres below the eyes, facing the head
+
+// vr_menu.c: the pause menu, a panel in the room (its own quad layer)
+#define VR_MENU_WIDTH    1024 // panel image, pixels
+#define VR_MENU_HEIGHT   704
+#define VR_MENU_METRES   1.2f // panel width in the room
+#define VR_MENU_DISTANCE 1.3f // from the head when it opens
+#define VR_MENU_DROP     0.15f // below eye height
+#define VR_MENU_BACKDROP 0.5f // panel alpha behind the drawing (premultiplied: darkens the world behind it)
+void VR_MenuInit( void );        // registers its cvars and commands, from VR_Init
+void VR_LoadMenuAssets( void );  // with the map, from VR_LoadModels
+void VR_MenuButton( void );      // the controller's menu button went down
+void VR_MenuUpdate( void );      // once a frame after the controllers are read, from VR_PreCreateMove
+qboolean VR_MenuOpen( void );
+qboolean VR_MenuHoldsFire( void ); // the menu closed with the trigger still pulled
+float VR_MenuDim( void );        // how dark the world is behind the menu, 0..1
+const XrPosef *VR_MenuPose( void ); // the panel's center in the play space
+void VR_MenuDraw( int vw, int vh ); // into a vw x vh viewport, renderer in 2D mode
+void VR_MenuInfo( void );        // for vr_info
 
 // vr_weaponmodels.c
 //

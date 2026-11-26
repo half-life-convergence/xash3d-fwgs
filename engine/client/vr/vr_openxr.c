@@ -115,6 +115,7 @@ static struct
 	void (APIENTRY *Clear)( unsigned int mask );
 	void (APIENTRY *Viewport)( vr_GLint x, vr_GLint y, int width, int height );
 	void (APIENTRY *RenderbufferStorageMultisample)( vr_GLenum target, int samples, vr_GLenum format, int width, int height );
+	void (APIENTRY *ColorMask)( vr_GLboolean r, vr_GLboolean g, vr_GLboolean b, vr_GLboolean a );
 } vrgl;
 
 static const dllfunc_t openxr_loader_funcs[] =
@@ -147,6 +148,7 @@ typedef struct
 	float    submit; // ms in xrEndFrame
 	int      transition; // VR_TRANSITION_*
 	int      state; // cls.state
+	qboolean menu; // the pause menu's panel was up
 	char     map[32];
 } vr_hitch_t;
 
@@ -260,6 +262,12 @@ static struct
 	qboolean fadeout_done; // the fade-out before a level change is black, let the load run this frame
 	qboolean game_paused; // the session lost focus, the game is paused
 	uint32_t frames_panel; // frames submitted with the loading panel
+
+	// the pause menu's panel (vr_menu.c draws it), submitted over the eyes
+	XrSwapchain menu_swapchain;
+	XrSwapchainImageOpenGLKHR *menu_images;
+	uint32_t menu_num_images;
+	qboolean menu_drawn; // the menu's image holds this opening's menu
 
 	uint32_t frames; // frames submitted since the session began
 	uint32_t frames_rendered; // ... of which the renderer drew the eyes
@@ -693,6 +701,7 @@ static qboolean VR_LoadGL( void )
 		{ "glClear", (void **)&vrgl.Clear },
 		{ "glViewport", (void **)&vrgl.Viewport },
 		{ "glRenderbufferStorageMultisample", (void **)&vrgl.RenderbufferStorageMultisample },
+		{ "glColorMask", (void **)&vrgl.ColorMask },
 	};
 	size_t i;
 
@@ -865,13 +874,14 @@ static qboolean VR_CreateEyeTargets( void )
 }
 
 /*
-VR_CreatePanel
+VR_CreateQuadSwapchain
 
-The loading panel's swapchain, made once per session. It's small and
-doesn't depend on vr_renderscale or vr_msaa. Without it loading still
-works, the headset just gets no layers then.
+A swapchain for a quad layer (the loading panel, the pause menu), made
+once per session. They're small and don't depend on vr_renderscale or
+vr_msaa. Without one the game still works, that layer just isn't shown.
 */
-static void VR_CreatePanel( void )
+static qboolean VR_CreateQuadSwapchain( const char *what, uint32_t width, uint32_t height,
+	XrSwapchain *swapchain, XrSwapchainImageOpenGLKHR **images, uint32_t *num_images )
 {
 	XrSwapchainCreateInfo info = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
 	XrResult result;
@@ -880,49 +890,67 @@ static void VR_CreatePanel( void )
 	info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
 	info.format = vr.swapchain_format;
 	info.sampleCount = 1;
-	info.width = VR_PANEL_WIDTH;
-	info.height = VR_PANEL_HEIGHT;
+	info.width = width;
+	info.height = height;
 	info.faceCount = 1;
 	info.arraySize = 1;
 	info.mipCount = 1;
 
-	result = pxrCreateSwapchain( vr.session, &info, &vr.panel_swapchain );
+	*images = NULL;
+	*num_images = 0;
+
+	result = pxrCreateSwapchain( vr.session, &info, swapchain );
 	if( XR_FAILED( result ))
 	{
-		vr.panel_swapchain = XR_NULL_HANDLE;
-		Con_Printf( S_WARN "VR: can't create the loading panel: %s\n", VR_ResultString( result ));
-		return;
+		*swapchain = XR_NULL_HANDLE;
+		Con_Printf( S_WARN "VR: can't create the %s: %s\n", what, VR_ResultString( result ));
+		return false;
 	}
 
-	pxrEnumerateSwapchainImages( vr.panel_swapchain, 0, &vr.panel_num_images, NULL );
-	vr.panel_images = Mem_Calloc( host.mempool, sizeof( *vr.panel_images ) * vr.panel_num_images );
-	for( i = 0; i < vr.panel_num_images; i++ )
-		vr.panel_images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
+	pxrEnumerateSwapchainImages( *swapchain, 0, num_images, NULL );
+	*images = Mem_Calloc( host.mempool, sizeof( **images ) * *num_images );
+	for( i = 0; i < *num_images; i++ )
+		(*images)[i].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
 
-	result = pxrEnumerateSwapchainImages( vr.panel_swapchain, vr.panel_num_images, &vr.panel_num_images,
-		(XrSwapchainImageBaseHeader *)vr.panel_images );
+	result = pxrEnumerateSwapchainImages( *swapchain, *num_images, num_images, (XrSwapchainImageBaseHeader *)*images );
 	if( XR_FAILED( result ))
 	{
-		Con_Printf( S_WARN "VR: can't get the loading panel images: %s\n", VR_ResultString( result ));
-		pxrDestroySwapchain( vr.panel_swapchain );
-		vr.panel_swapchain = XR_NULL_HANDLE;
-		Mem_Free( vr.panel_images );
-		vr.panel_images = NULL;
-		vr.panel_num_images = 0;
+		Con_Printf( S_WARN "VR: can't get the %s images: %s\n", what, VR_ResultString( result ));
+		pxrDestroySwapchain( *swapchain );
+		*swapchain = XR_NULL_HANDLE;
+		Mem_Free( *images );
+		*images = NULL;
+		*num_images = 0;
+		return false;
 	}
+
+	return true;
+}
+
+static void VR_DestroyQuadSwapchain( XrSwapchain *swapchain, XrSwapchainImageOpenGLKHR **images, uint32_t *num_images )
+{
+	if( *swapchain != XR_NULL_HANDLE )
+		pxrDestroySwapchain( *swapchain );
+	*swapchain = XR_NULL_HANDLE;
+
+	if( *images )
+		Mem_Free( *images );
+	*images = NULL;
+	*num_images = 0;
+}
+
+static void VR_CreatePanel( void )
+{
+	VR_CreateQuadSwapchain( "loading panel", VR_PANEL_WIDTH, VR_PANEL_HEIGHT, &vr.panel_swapchain, &vr.panel_images, &vr.panel_num_images );
+	VR_CreateQuadSwapchain( "pause menu panel", VR_MENU_WIDTH, VR_MENU_HEIGHT, &vr.menu_swapchain, &vr.menu_images, &vr.menu_num_images );
 }
 
 static void VR_DestroyPanel( void )
 {
-	if( vr.panel_swapchain != XR_NULL_HANDLE )
-		pxrDestroySwapchain( vr.panel_swapchain );
-	vr.panel_swapchain = XR_NULL_HANDLE;
-
-	if( vr.panel_images )
-		Mem_Free( vr.panel_images );
-	vr.panel_images = NULL;
-	vr.panel_num_images = 0;
+	VR_DestroyQuadSwapchain( &vr.panel_swapchain, &vr.panel_images, &vr.panel_num_images );
+	VR_DestroyQuadSwapchain( &vr.menu_swapchain, &vr.menu_images, &vr.menu_num_images );
 	vr.panel_valid = false;
+	vr.menu_drawn = false;
 }
 
 static qboolean VR_CreateSwapchains( void )
@@ -1357,10 +1385,104 @@ static void VR_UpdateFade( const ref_viewpass_t *rvp, const vec3_t head, const v
 	vr.fade = fade;
 }
 
+/*
+VR_DrawMenuPanel
+
+While the pause menu is up, draws it into its own swapchain image once a
+frame (the pointer moves), and VR_SubmitFrame puts that over the eyes.
+The image is cleared to black at VR_MENU_BACKDROP alpha; the menu draws
+additively on top with alpha writes off, so in the premultiplied quad
+the backdrop darkens the world behind the panel and the orange adds light
+to it, like the HUD on the desktop.
+*/
+static void VR_DrawMenuPanel( void )
+{
+	XrSwapchainImageAcquireInfo acquire = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+	XrSwapchainImageWaitInfo wait = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+	XrSwapchainImageReleaseInfo release = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+	vr_GLint old_draw = 0, old_read = 0;
+	qboolean scissor, srgb;
+	uint32_t index;
+
+	if( !VR_MenuOpen( ))
+	{
+		vr.menu_drawn = false;
+		return;
+	}
+
+	if( vr.menu_swapchain == XR_NULL_HANDLE || !vr.fbo || refState.width <= 0 || refState.height <= 0 )
+		return;
+
+	if( XR_FAILED( pxrAcquireSwapchainImage( vr.menu_swapchain, &acquire, &index )))
+		return;
+
+	wait.timeout = XR_INFINITE_DURATION;
+	if( XR_FAILED( pxrWaitSwapchainImage( vr.menu_swapchain, &wait )))
+		return;
+
+	vrgl.GetIntegerv( VR_GL_DRAW_FRAMEBUFFER_BINDING, &old_draw );
+	vrgl.GetIntegerv( VR_GL_READ_FRAMEBUFFER_BINDING, &old_read );
+	scissor = vrgl.IsEnabled( VR_GL_SCISSOR_TEST );
+	srgb = vrgl.IsEnabled( VR_GL_FRAMEBUFFER_SRGB );
+	if( scissor ) vrgl.Disable( VR_GL_SCISSOR_TEST );
+	if( srgb ) vrgl.Disable( VR_GL_FRAMEBUFFER_SRGB );
+
+	// the renderer's 2D mode maps window coordinates onto the viewport
+	ref.dllFuncs.R_Set2DMode( true );
+	vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.fbo );
+	vrgl.FramebufferTexture2D( VR_GL_FRAMEBUFFER, VR_GL_COLOR_ATTACHMENT0, VR_GL_TEXTURE_2D, vr.menu_images[index].image, 0 );
+
+	if( vrgl.CheckFramebufferStatus( VR_GL_FRAMEBUFFER ) == VR_GL_FRAMEBUFFER_COMPLETE )
+	{
+		vrgl.Viewport( 0, 0, VR_MENU_WIDTH, VR_MENU_HEIGHT );
+		vrgl.ClearColor( 0.0f, 0.0f, 0.0f, VR_MENU_BACKDROP );
+		vrgl.Clear( VR_GL_COLOR_BUFFER_BIT );
+		vrgl.Disable( VR_GL_ALPHA_TEST );
+		vrgl.ColorMask( 1, 1, 1, 0 );
+		VR_MenuDraw( VR_MENU_WIDTH, VR_MENU_HEIGHT );
+		vrgl.ColorMask( 1, 1, 1, 1 );
+		vr.menu_drawn = true;
+	}
+
+	ref.dllFuncs.R_Set2DMode( false );
+	vrgl.BindFramebuffer( VR_GL_FRAMEBUFFER, vr.fbo );
+	vrgl.FramebufferTexture2D( VR_GL_FRAMEBUFFER, VR_GL_COLOR_ATTACHMENT0, VR_GL_TEXTURE_2D, 0, 0 );
+	pxrReleaseSwapchainImage( vr.menu_swapchain, &release );
+
+	vrgl.BindFramebuffer( VR_GL_DRAW_FRAMEBUFFER, old_draw );
+	vrgl.BindFramebuffer( VR_GL_READ_FRAMEBUFFER, old_read );
+	vrgl.Viewport( 0, 0, refState.width, refState.height );
+	if( scissor ) vrgl.Enable( VR_GL_SCISSOR_TEST );
+	if( srgb ) vrgl.Enable( VR_GL_FRAMEBUFFER_SRGB );
+}
+
+/*
+VR_DrawDesktopMenu
+
+The desktop window shows the left eye, which has no quad layers in it:
+draw the menu over it too, so someone watching sees what the player does.
+*/
+static void VR_DrawDesktopMenu( void )
+{
+	qboolean scissor = vrgl.IsEnabled( VR_GL_SCISSOR_TEST );
+
+	if( refState.width <= 0 || refState.height <= 0 )
+		return;
+
+	if( scissor ) vrgl.Disable( VR_GL_SCISSOR_TEST );
+	ref.dllFuncs.R_Set2DMode( true ); // binds the screen and sets the window viewport
+	vrgl.Disable( VR_GL_ALPHA_TEST );
+	ref.dllFuncs.FillRGBA( kRenderTransTexture, 0, 0, refState.width, refState.height, 0, 0, 0, (byte)( VR_MENU_BACKDROP * 255.0f ));
+	VR_MenuDraw( refState.width, refState.height );
+	ref.dllFuncs.R_Set2DMode( false );
+	if( scissor ) vrgl.Enable( VR_GL_SCISSOR_TEST );
+}
+
 static void VR_DrawFade( void )
 {
-	// the head-in-wall fade and the fade-in after loading share one black overlay
-	float fade = Q_max( vr.fade, vr.load_fade );
+	// the head-in-wall fade, the fades around loading and the dimming
+	// behind the pause menu share one black overlay
+	float fade = Q_max( Q_max( vr.fade, vr.load_fade ), VR_MenuDim( ));
 
 	if( fade <= 0.0f )
 		return;
@@ -2728,6 +2850,9 @@ static int VR_RenderEyesTimed( const ref_viewpass_t *rvp )
 	vrgl.BindFramebuffer( VR_GL_READ_FRAMEBUFFER, old_read );
 	if( scissor ) vrgl.Enable( VR_GL_SCISSOR_TEST );
 
+	if( stepped )
+		VR_DrawMenuPanel( );
+
 	if( mirrored )
 		return VR_EYES_MIRRORED;
 	return stepped ? VR_EYES_RENDERED : VR_EYES_NONE;
@@ -2824,9 +2949,10 @@ VR_PausesGame
 Called through CL_IsInGame: singleplayer stops simulating and game sounds
 pause while it returns true, exactly like with the menu open. True while
 the session isn't focused: the headset is off or asleep, or the runtime's
-system menu is up. The game resumes by itself when focus comes back.
+system menu is up (the game resumes by itself when focus comes back),
+and while our own pause menu is up.
 */
-qboolean VR_PausesGame( void )
+static qboolean VR_Unfocused( void )
 {
 	if( !vr.initialized || vr.session == XR_NULL_HANDLE || cls.state != ca_active )
 		return false;
@@ -2835,6 +2961,15 @@ qboolean VR_PausesGame( void )
 		return true;
 
 	return vr.session_state != XR_SESSION_STATE_FOCUSED;
+}
+
+qboolean VR_PausesGame( void )
+{
+	if( VR_Unfocused( ))
+		return true;
+
+	// the VR pause menu pauses like Half-Life's own menu
+	return vr.initialized && cls.state == ca_active && VR_MenuOpen( );
 }
 
 /*
@@ -2947,7 +3082,7 @@ static void VR_DrawPanel( void )
 	if( srgb ) vrgl.Enable( VR_GL_FRAMEBUFFER_SRGB );
 }
 
-void VR_CopyDesktopToEyes( void )
+static void VR_CopyDesktop( void )
 {
 	vr_GLint old_draw = 0, old_read = 0;
 	qboolean scissor, srgb;
@@ -3024,6 +3159,16 @@ void VR_CopyDesktopToEyes( void )
 	vrgl.BindFramebuffer( VR_GL_READ_FRAMEBUFFER, old_read );
 	if( scissor ) vrgl.Enable( VR_GL_SCISSOR_TEST );
 	if( srgb ) vrgl.Enable( VR_GL_FRAMEBUFFER_SRGB );
+}
+
+void VR_CopyDesktopToEyes( void )
+{
+	VR_CopyDesktop( );
+
+	// after any copy, so the eyes never get a head-locked menu: the
+	// headset has the menu's own panel in the room
+	if( VR_MenuOpen( ))
+		VR_DrawDesktopMenu( );
 }
 
 static void VR_PrintHitches( void );
@@ -3208,13 +3353,13 @@ void VR_PollEvents( void )
 }
 
 /*
-VR_PlacePanel
+VR_PoseAhead
 
-Puts the loading panel 2 m in front of where the head faces, level, at
-eye height, turned toward the head. It stays at that spot in the room,
-so looking around while the game is frozen behaves like the real world.
+A pose distance metres in front of where the head faces, level, drop
+metres below eye height, turned toward the head. Quads put there stay at
+that spot in the room, so looking around behaves like the real world.
 */
-static void VR_PlacePanel( void )
+void VR_PoseAhead( float distance, float drop, XrPosef *out )
 {
 	static const XrVector3f xr_forward = { 0.0f, 0.0f, -1.0f };
 	XrVector3f head = { 0.0f, 1.6f, 0.0f }, f = { 0.0f, 0.0f, -1.0f }, axis;
@@ -3235,16 +3380,34 @@ static void VR_PlacePanel( void )
 		}
 	}
 
-	vr.panel_pose.position.x = head.x + f.x * VR_PANEL_DISTANCE;
-	vr.panel_pose.position.y = head.y;
-	vr.panel_pose.position.z = head.z + f.z * VR_PANEL_DISTANCE;
+	out->position.x = head.x + f.x * distance;
+	out->position.y = head.y - drop;
+	out->position.z = head.z + f.z * distance;
 
 	// a quad faces along its +Z: turn around Y so -Z points away from the head
 	theta = atan2f( -f.x, -f.z );
-	vr.panel_pose.orientation.x = 0.0f;
-	vr.panel_pose.orientation.y = sinf( theta * 0.5f );
-	vr.panel_pose.orientation.z = 0.0f;
-	vr.panel_pose.orientation.w = cosf( theta * 0.5f );
+	out->orientation.x = 0.0f;
+	out->orientation.y = sinf( theta * 0.5f );
+	out->orientation.z = 0.0f;
+	out->orientation.w = cosf( theta * 0.5f );
+}
+
+/*
+VR_PlacePanel
+
+Puts the loading panel 2 m in front of where the head faces, at eye
+height.
+*/
+static void VR_PlacePanel( void )
+{
+	VR_PoseAhead( VR_PANEL_DISTANCE, 0.0f, &vr.panel_pose );
+}
+
+qboolean VR_HandAimPose( int hand, XrPosef *out )
+{
+	if( !vr.running || !vr.display_time || vr.space == XR_NULL_HANDLE )
+		return false;
+	return VR_GetHandPose( hand, VR_POSE_AIM, vr.display_time, vr.space, out );
 }
 
 static void VR_SetTransition( int transition, double now )
@@ -3280,7 +3443,7 @@ vr_levelfade 0 cut straight to the panel.
 static void VR_UpdateTransition( void )
 {
 	double now = Platform_DoubleTime(), dt = now - vr.transition_last;
-	qboolean loading = VR_GameLoading( ), paused = VR_PausesGame( );
+	qboolean loading = VR_GameLoading( ), paused = VR_Unfocused( );
 
 	vr.transition_last = now;
 
@@ -3361,7 +3524,8 @@ static void VR_SubmitFrame( void )
 	XrCompositionLayerProjection layer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
 	XrCompositionLayerQuad quad = { XR_TYPE_COMPOSITION_LAYER_QUAD };
 	XrCompositionLayerProjectionView views[2];
-	const XrCompositionLayerBaseHeader *layers[1];
+	XrCompositionLayerQuad menu = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+	const XrCompositionLayerBaseHeader *layers[2];
 	XrResult result;
 	int eye;
 
@@ -3419,6 +3583,22 @@ static void VR_SubmitFrame( void )
 		info.layerCount = 1;
 		info.layers = layers;
 		vr.submits_layers = true; // from now on the headset paces frames
+
+		// the pause menu floats in the room over the world
+		if( VR_MenuOpen( ) && vr.menu_drawn )
+		{
+			menu.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT; // premultiplied
+			menu.space = vr.space;
+			menu.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+			menu.subImage.swapchain = vr.menu_swapchain;
+			menu.subImage.imageRect.extent.width = VR_MENU_WIDTH;
+			menu.subImage.imageRect.extent.height = VR_MENU_HEIGHT;
+			menu.pose = *VR_MenuPose( );
+			menu.size.width = VR_MENU_METRES;
+			menu.size.height = VR_MENU_METRES * VR_MENU_HEIGHT / VR_MENU_WIDTH;
+			layers[1] = (const XrCompositionLayerBaseHeader *)&menu;
+			info.layerCount = 2;
+		}
 	}
 
 	vr.eyes_written = false;
@@ -3471,6 +3651,7 @@ static void VR_RecordFrame( double now )
 		h->submit = (float)( vr.submit_time * 1000.0 );
 		h->transition = vr.transition;
 		h->state = cls.state;
+		h->menu = VR_MenuOpen( );
 		Q_strncpy( h->map, cl.worldmodel ? cl.worldmodel->name : "", sizeof( h->map ));
 		vr.hitch_count++;
 	}
@@ -3502,10 +3683,10 @@ static void VR_PrintHitches( void )
 		const vr_hitch_t *h = &vr.hitches[i % VR_HITCHES];
 		float rest = h->loop - h->wait - h->render - h->submit;
 
-		Con_Printf( "VR:   at %7.1f s: %6.1f ms = wait %5.1f + eyes %5.1f + xrEndFrame %5.1f + game %6.1f  (%s, cls.state %d, %s)\n",
+		Con_Printf( "VR:   at %7.1f s: %6.1f ms = wait %5.1f + eyes %5.1f + xrEndFrame %5.1f + game %6.1f  (%s%s, cls.state %d, %s)\n",
 			h->when, h->loop, h->wait, h->render, h->submit, rest,
 			h->transition >= 0 && h->transition < (int)ARRAYSIZE( transitions ) ? transitions[h->transition] : "?",
-			h->state, h->map[0] ? h->map : "no map" );
+			h->menu ? ", pause menu up" : "", h->state, h->map[0] ? h->map : "no map" );
 	}
 }
 
@@ -3648,6 +3829,8 @@ static void VR_Info_f( void )
 		Con_Printf( "VR: %s (black %.2f, %.2f s in), game %s\n", names[bound( 0, vr.transition, 4 )], vr.load_fade,
 			Platform_DoubleTime() - vr.transition_time, vr.game_paused ? "paused (no focus)" : "running" );
 	}
+
+	VR_MenuInfo( );
 
 	Con_Printf( "VR: room scale %s, player at %.1f %.1f %.1f yaw %.0f, head %.1f units away, wall fade %.2f\n",
 		vr_roomscale.value ? "on" : "off", cl.simorg[0], cl.simorg[1], cl.simorg[2], cl.viewangles[YAW],
@@ -3797,6 +3980,7 @@ void VR_Init( void )
 	VR_WeaponModelsInit( );
 	VR_HandsInit( );
 	VR_ReloadInit( );
+	VR_MenuInit( );
 	Cvar_RegisterVariable( &vr_weapon_length );
 	Cvar_RegisterVariable( &vr_loadfade );
 	Cvar_RegisterVariable( &vr_levelfade );
