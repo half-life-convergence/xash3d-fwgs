@@ -1265,19 +1265,31 @@ static void VR_UpdateRoom( float yaw_degrees )
 	vr.head_prev_valid = true;
 }
 
+static void VR_EyeView( const ref_viewpass_t *rvp, const XrPosef *pose, const vec3_t head, vec3_t origin, vec3_t angles );
+
+#define VR_EYE_ZNEAR      1.5f // the eyes' near plane, as in R_SetupProjectionMatrix (ref/gl/gl_rmain.c)
+#define VR_WALLFADE_BLACK 0.5f // units before the near plane touches a surface: fully black
+#define VR_WALLFADE_RANGE 3.0f // units over which the view fades before that
+
 /*
 VR_UpdateFade
 
-Head-in-wall fade: trace from the collision box's eye point to the real
-head. If something solid is in between, the head is in or past a wall,
-and the view fades to black over the first few units of depth, so the
-player can't look through walls by leaning or walking into them.
+Head-in-wall fade. First, trace from the collision box's eye point to the
+real head: if something solid is in between, the head is past a wall and
+the view is black. That alone is too late, though: each eye sits beside
+the head center and draws from a near plane 1.5 units in front of it, its
+corners 3 units or more away, so the near plane cuts into a wall well
+before the center reaches it. So it also traces from the head center
+through each eye's near-plane corners and center, a little past them: the
+view is black before any of them touches a surface and fades in over the
+VR_WALLFADE_RANGE units before that. 11 point traces a frame, no allocation.
 */
-static void VR_UpdateFade( const vec3_t head_world )
+static void VR_UpdateFade( const ref_viewpass_t *rvp, const vec3_t head, const vec3_t head_world )
 {
-	vec3_t start, dir;
+	vec3_t start;
 	pmtrace_t tr;
-	float len, depth;
+	float fade = 0.0f;
+	int eye, i;
 
 	vr.fade = 0.0f;
 
@@ -1287,20 +1299,62 @@ static void VR_UpdateFade( const vec3_t head_world )
 	VectorCopy( cl.simorg, start );
 	start[2] += cl.viewheight[2];
 
-	VectorSubtract( head_world, start, dir );
-	len = VectorLength( dir );
-	if( len < 1.0f )
-		return;
-
 	// solid geometry only (point hull, studio models skipped); not
 	// PM_CL_TraceLine, whose third argument is a mode, so PM_STUDIO_IGNORE
 	// there would trace every visible entity
 	tr = CL_TraceLine( start, (float *)head_world, PM_STUDIO_IGNORE );
-	if( tr.fraction >= 1.0f && !tr.allsolid )
+	if( tr.allsolid || tr.startsolid || tr.fraction < 1.0f )
+	{
+		vr.fade = 1.0f; // the head is past a wall
 		return;
+	}
 
-	depth = tr.allsolid ? len : ( 1.0f - tr.fraction ) * len;
-	vr.fade = bound( 0.0f, depth / 6.0f, 1.0f ); // black after 6 units (~15 cm) into the wall
+	for( eye = 0; eye < 2 && fade < 1.0f; eye++ )
+	{
+		const XrFovf *fov = &vr.views[eye].fov;
+		const float tx[5] = { 0.0f, tanf( fov->angleLeft ), tanf( fov->angleRight ), tanf( fov->angleLeft ), tanf( fov->angleRight ) };
+		const float ty[5] = { 0.0f, tanf( fov->angleDown ), tanf( fov->angleDown ), tanf( fov->angleUp ), tanf( fov->angleUp ) };
+		vec3_t origin, angles, forward, right, up;
+
+		VR_EyeView( rvp, &vr.views[eye].pose, head, origin, angles );
+		AngleVectors( angles, forward, right, up );
+
+		for( i = 0; i < 5 && fade < 1.0f; i++ )
+		{
+			vec3_t corner, dir, end;
+			float dist, reach, hit, f;
+
+			int k;
+
+			// the near-plane point, then its direction from the head center (written
+			// out per component, not as in-place VectorMA calls: see the MSVC
+			// miscompile note in CLAUDE.md)
+			for( k = 0; k < 3; k++ )
+			{
+				corner[k] = origin[k] + VR_EYE_ZNEAR * ( forward[k] + tx[i] * right[k] + ty[i] * up[k] );
+				dir[k] = corner[k] - head_world[k];
+			}
+
+			dist = VectorNormalizeLength( dir );
+			reach = dist + VR_WALLFADE_BLACK + VR_WALLFADE_RANGE;
+			VectorMA( head_world, reach, dir, end );
+
+			tr = CL_TraceLine( (float *)head_world, end, PM_STUDIO_IGNORE );
+			if( tr.allsolid || tr.startsolid )
+			{
+				fade = 1.0f;
+				break;
+			}
+			if( tr.fraction >= 1.0f )
+				continue;
+
+			hit = tr.fraction * reach; // how far along the ray the surface is
+			f = 1.0f - ( hit - dist - VR_WALLFADE_BLACK ) / VR_WALLFADE_RANGE;
+			fade = Q_max( fade, bound( 0.0f, f, 1.0f ));
+		}
+	}
+
+	vr.fade = fade;
 }
 
 static void VR_DrawFade( void )
@@ -2576,7 +2630,7 @@ static int VR_RenderEyesTimed( const ref_viewpass_t *rvp )
 		head_world[1] += vr.room_gap[1];
 	}
 	if( vr.space_type == XR_REFERENCE_SPACE_TYPE_STAGE )
-		VR_UpdateFade( head_world );
+		VR_UpdateFade( rvp, head, head_world );
 	else vr.fade = 0.0f;
 
 	vrgl.GetIntegerv( VR_GL_DRAW_FRAMEBUFFER_BINDING, &old_draw );
