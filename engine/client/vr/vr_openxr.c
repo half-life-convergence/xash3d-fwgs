@@ -136,6 +136,20 @@ static dll_info_t openxr_loader_info =
 	.crash = false,
 };
 
+// one slow frame, see VR_RecordFrame
+#define VR_HITCHES 16
+typedef struct
+{
+	double   when; // seconds since the session began
+	float    loop; // ms, from one xrWaitFrame to the next
+	float    wait; // ms in xrWaitFrame
+	float    render; // ms drawing the eyes
+	float    submit; // ms in xrEndFrame
+	int      transition; // VR_TRANSITION_*
+	int      state; // cls.state
+	char     map[32];
+} vr_hitch_t;
+
 static struct
 {
 	qboolean   initialized;
@@ -262,6 +276,20 @@ static struct
 	double   step_jitter_total; // how far the wall clock's step was from frame_step, summed
 	double   step_jitter_max;
 	uint32_t step_frames; // frames those two cover
+
+	// slow frames, see VR_RecordFrame: this loop's timings, and a fixed ring
+	// of the frames that took over 1.5 display periods (no allocation, no I/O)
+	double   loop_start; // when this loop's xrWaitFrame started, 0 = none yet
+	double   wait_time; // this loop: seconds in xrWaitFrame
+	double   render_time; // ... drawing the eyes
+	double   submit_time; // ... in xrEndFrame
+	double   loop_total; // summed over the paced loops, for the averages in the frame stats
+	double   render_total;
+	double   submit_total;
+	double   loopwait_total;
+	uint32_t loop_frames;
+	vr_hitch_t hitches[VR_HITCHES];
+	uint32_t hitch_count; // since the session began, the ring keeps the last VR_HITCHES
 } vr;
 
 // Half-Life units are close to inches: the player is 72 units tall and
@@ -2465,7 +2493,18 @@ events. The right eye, and the desktop pass if it still runs, are
 RF_REPEAT_PASS. With vr_mirror 0 the left eye is also copied into the
 desktop view and the desktop pass is skipped.
 */
+static int VR_RenderEyesTimed( const ref_viewpass_t *rvp );
+
 int VR_RenderEyes( const ref_viewpass_t *rvp )
+{
+	double t = Platform_DoubleTime();
+	int result = VR_RenderEyesTimed( rvp );
+
+	vr.render_time += Platform_DoubleTime() - t;
+	return result;
+}
+
+static int VR_RenderEyesTimed( const ref_viewpass_t *rvp )
 {
 	vr_GLint old_draw = 0, old_read = 0;
 	qboolean scissor, stepped = false, mirrored = false;
@@ -2933,6 +2972,8 @@ void VR_CopyDesktopToEyes( void )
 	if( srgb ) vrgl.Enable( VR_GL_FRAMEBUFFER_SRGB );
 }
 
+static void VR_PrintHitches( void );
+
 static void VR_PrintFrameStats( void )
 {
 	double elapsed = Platform_DoubleTime() - vr.begin_time;
@@ -2948,6 +2989,7 @@ static void VR_PrintFrameStats( void )
 	Con_Printf( "VR: game time steps by %s; the wall clock was off by %.2f ms per frame on average, %.2f ms at most\n",
 		vr_displaytime.value ? "display time" : "the wall clock",
 		vr.step_frames ? vr.step_jitter_total * 1000.0 / vr.step_frames : 0.0, vr.step_jitter_max * 1000.0 );
+	VR_PrintHitches( );
 }
 
 // the desktop mirror window must not wait for vsync while VR runs, the
@@ -2988,6 +3030,10 @@ static void VR_BeginSession( void )
 	vr.step_jitter_total = vr.step_jitter_max = 0.0;
 	vr.step_frames = 0;
 	vr.prev_display_time = 0;
+	vr.hitch_count = 0;
+	vr.loop_start = 0.0;
+	vr.loop_total = vr.loopwait_total = vr.render_total = vr.submit_total = 0.0;
+	vr.loop_frames = 0;
 	vr.begin_time = Platform_DoubleTime();
 	Con_Printf( "VR: session running\n" );
 }
@@ -3323,12 +3369,90 @@ static void VR_SubmitFrame( void )
 
 	vr.eyes_written = false;
 
-	result = pxrEndFrame( vr.session, &info );
+	{
+		double t = Platform_DoubleTime();
+		result = pxrEndFrame( vr.session, &info );
+		vr.submit_time += Platform_DoubleTime() - t;
+	}
 	vr.frame_begun = false;
 
 	if( XR_FAILED( result ))
 		Con_Printf( S_ERROR "VR: xrEndFrame failed: %s\n", VR_ResultString( result ));
 	else vr.frames++;
+}
+
+/*
+VR_RecordFrame
+
+Called right before xrWaitFrame with the time: the loop since the last
+xrWaitFrame started is over. If it took over 1.5 display periods while
+the headset paces the frames, it goes into the hitch ring with where the
+time went: the wait, drawing the eyes, xrEndFrame, and the rest (the
+game, sound, the client) is loop minus those. Fixed memory only, so
+recording a slow frame can't slow the next one.
+*/
+static void VR_RecordFrame( double now )
+{
+	double loop = now - vr.loop_start;
+	double period = vr.display_period / 1e9;
+
+	// where an average frame's time goes, loads and long gaps left out
+	if( vr.loop_start > 0.0 && vr.paced && vr.transition == VR_TRANSITION_NONE && loop < 0.1 )
+	{
+		vr.loop_total += loop;
+		vr.loopwait_total += vr.wait_time;
+		vr.render_total += vr.render_time;
+		vr.submit_total += vr.submit_time;
+		vr.loop_frames++;
+	}
+
+	if( vr.loop_start > 0.0 && vr.paced && period > 0.0 && loop > 1.5 * period )
+	{
+		vr_hitch_t *h = &vr.hitches[vr.hitch_count % VR_HITCHES];
+
+		h->when = now - vr.begin_time;
+		h->loop = (float)( loop * 1000.0 );
+		h->wait = (float)( vr.wait_time * 1000.0 );
+		h->render = (float)( vr.render_time * 1000.0 );
+		h->submit = (float)( vr.submit_time * 1000.0 );
+		h->transition = vr.transition;
+		h->state = cls.state;
+		Q_strncpy( h->map, cl.worldmodel ? cl.worldmodel->name : "", sizeof( h->map ));
+		vr.hitch_count++;
+	}
+
+	vr.loop_start = now;
+	vr.wait_time = vr.render_time = vr.submit_time = 0.0;
+}
+
+static void VR_PrintHitches( void )
+{
+	static const char *transitions[] = { "playing", "loading", "holding", "fading in", "fading out" };
+	uint32_t i, first;
+
+	if( vr.loop_frames )
+	{
+		double n = vr.loop_frames / 1000.0; // totals in seconds, averages in ms
+		double rest = vr.loop_total - vr.loopwait_total - vr.render_total - vr.submit_total;
+
+		Con_Printf( "VR: an average frame in play: %.2f ms = wait %.2f + eyes %.2f + xrEndFrame %.2f + game %.2f\n",
+			vr.loop_total / n, vr.loopwait_total / n, vr.render_total / n, vr.submit_total / n, rest / n );
+	}
+
+	Con_Printf( "VR: %u slow frames (over 1.5 display periods)%s\n", vr.hitch_count,
+		vr.hitch_count > VR_HITCHES ? va( ", the last %d:", VR_HITCHES ) : vr.hitch_count ? ":" : "" );
+
+	first = vr.hitch_count > VR_HITCHES ? vr.hitch_count - VR_HITCHES : 0;
+	for( i = first; i < vr.hitch_count; i++ )
+	{
+		const vr_hitch_t *h = &vr.hitches[i % VR_HITCHES];
+		float rest = h->loop - h->wait - h->render - h->submit;
+
+		Con_Printf( "VR:   at %7.1f s: %6.1f ms = wait %5.1f + eyes %5.1f + xrEndFrame %5.1f + game %6.1f  (%s, cls.state %d, %s)\n",
+			h->when, h->loop, h->wait, h->render, h->submit, rest,
+			h->transition >= 0 && h->transition < (int)ARRAYSIZE( transitions ) ? transitions[h->transition] : "?",
+			h->state, h->map[0] ? h->map : "no map" );
+	}
 }
 
 void VR_WaitFrame( void )
@@ -3369,10 +3493,12 @@ void VR_WaitFrame( void )
 	// blocks until the runtime wants the next frame; this is the frame limiter
 	{
 		double t = Platform_DoubleTime();
+
+		VR_RecordFrame( t ); // the loop that ends here
 		result = pxrWaitFrame( vr.session, &wait_info, &state );
-		t = Platform_DoubleTime() - t;
-		vr.wait_total += t;
-		vr.wait_max = Q_max( vr.wait_max, t );
+		vr.wait_time = Platform_DoubleTime() - t;
+		vr.wait_total += vr.wait_time;
+		vr.wait_max = Q_max( vr.wait_max, vr.wait_time );
 	}
 	if( XR_FAILED( result ))
 	{
