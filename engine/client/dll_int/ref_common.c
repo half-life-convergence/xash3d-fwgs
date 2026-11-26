@@ -307,6 +307,9 @@ static void pfnDrawNormalTriangles( void )
 static void pfnDrawTransparentTriangles( void )
 {
 	clgame.dllFuncs.pfnDrawTransparentTriangles();
+#if XASH_OPENXR
+	VR_DrawTransparent(); // the menu's laser beam, eye passes only
+#endif
 }
 
 static screenfade_t *pfnRefGetScreenFade( void )

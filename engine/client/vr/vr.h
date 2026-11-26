@@ -111,6 +111,11 @@ void VR_MarkViewmodelArms( const char *modelname, struct studiohdr_s *phdr );
 // models/vr/v_X.mdl for every weapon v_X.mdl that has one, and the hands
 void VR_LoadModels( void );
 
+// called by the renderer's transparent-triangles callback (ref_common.c),
+// after the client's: in the eye passes, draws the VR world-space extras
+// (the menu's laser beam) with the TriAPI
+void VR_DrawTransparent( void );
+
 // extra ref_viewpass_t flags for the desktop pass of a frame whose eyes were drawn
 int VR_DesktopPassFlags( void );
 

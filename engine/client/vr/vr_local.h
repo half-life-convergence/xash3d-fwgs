@@ -64,6 +64,7 @@ qboolean VR_MenuOpen( void );
 qboolean VR_MenuHoldsFire( void ); // the menu closed with the trigger still pulled
 float VR_MenuDim( void );        // how dark the world is behind the menu, 0..1
 const XrPosef *VR_MenuPose( void ); // the panel's center in the play space
+qboolean VR_MenuBeam( XrVector3f *start, XrVector3f *end, qboolean *hit ); // the laser beam in the play space while the menu is up; hit: it ends on the panel
 void VR_MenuDraw( int vw, int vh ); // into a vw x vh viewport, renderer in 2D mode
 void VR_MenuInfo( void );        // for vr_info
 

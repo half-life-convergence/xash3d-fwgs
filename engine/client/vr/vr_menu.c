@@ -66,6 +66,7 @@ come in with the map (VR_LoadMenuAssets).
 #define VR_MENU_DIM_TIME  0.15f // seconds the dimming takes
 #define VR_MENU_PRESS     0.75f // trigger pulled this far clicks
 #define VR_MENU_RELEASE   0.35f // ... and must go back under this before the next click
+#define VR_BEAM_MISS      0.6f  // metres the laser beam reaches when it misses the panel
 
 typedef enum
 {
@@ -165,6 +166,11 @@ static struct
 	qboolean cursor_valid; // the pointer is on the panel
 	float    cursor_x, cursor_y; // panel pixels from the top left
 
+	// the laser beam, play space, see VR_MenuPointer
+	qboolean   beam_valid;
+	qboolean   beam_hit; // it ends on the panel
+	XrVector3f beam_start, beam_end;
+
 	qboolean trigger_down; // the right trigger is pulled (with hysteresis)
 	qboolean hold_fire; // the menu closed with the trigger pulled: no shot until it's let go
 	qboolean debug_click; // vr_debug_menuclick
@@ -252,6 +258,7 @@ static void VR_MenuSetOpen( qboolean open, qboolean sound )
 	vrm.page = VR_PAGE_MAIN;
 	vrm.hover = -1;
 	vrm.cursor_valid = false;
+	vrm.beam_valid = false;
 
 	if( open )
 	{
@@ -336,24 +343,55 @@ static float VR_Dot( const XrVector3f *a, const XrVector3f *b )
 VR_MenuPointer
 
 Where the right hand's aim ray meets the panel, in panel pixels. The quad
-faces along its +Z, its image's top is +Y.
+faces along its +Z, its image's top is +Y. Also sets the laser beam: from
+the hand to where the ray meets the panel, or VR_BEAM_MISS metres along
+the ray when it misses. With vr_debug_menupoint the beam goes to that
+point instead.
 */
 static qboolean VR_MenuPointer( float *px, float *py )
 {
 	XrPosef aim;
 	XrVector3f dir, normal, right, up, to, hit;
-	float denom, t, x, y, w, h;
+	float denom, t, x, y, w = VR_MENU_METRES, h = VR_MENU_METRES * VR_MENU_HEIGHT / VR_MENU_WIDTH;
+	qboolean has_aim = VR_HandAimPose( VR_HAND_RIGHT, &aim ), on;
 
-	if( vr_debug_menupoint.string[0] )
-		return sscanf( vr_debug_menupoint.string, "%f %f", px, py ) == 2;
+	vrm.beam_valid = false;
 
-	if( !VR_HandAimPose( VR_HAND_RIGHT, &aim ))
-		return false;
-
-	VR_Rotate( &aim.orientation, 0.0f, 0.0f, -1.0f, &dir );
 	VR_Rotate( &vrm.pose.orientation, 0.0f, 0.0f, 1.0f, &normal );
 	VR_Rotate( &vrm.pose.orientation, 1.0f, 0.0f, 0.0f, &right );
 	VR_Rotate( &vrm.pose.orientation, 0.0f, 1.0f, 0.0f, &up );
+
+	if( vr_debug_menupoint.string[0] )
+	{
+		if( sscanf( vr_debug_menupoint.string, "%f %f", px, py ) != 2 )
+			return false;
+
+		if( has_aim )
+		{
+			x = ( *px / VR_MENU_WIDTH - 0.5f ) * w;
+			y = ( 0.5f - *py / VR_MENU_HEIGHT ) * h;
+			vrm.beam_start = aim.position;
+			vrm.beam_end.x = vrm.pose.position.x + right.x * x + up.x * y;
+			vrm.beam_end.y = vrm.pose.position.y + right.y * x + up.y * y;
+			vrm.beam_end.z = vrm.pose.position.z + right.z * x + up.z * y;
+			vrm.beam_hit = true;
+			vrm.beam_valid = true;
+		}
+		return true;
+	}
+
+	if( !has_aim )
+		return false;
+
+	VR_Rotate( &aim.orientation, 0.0f, 0.0f, -1.0f, &dir );
+
+	// a beam that misses the panel ends a short way along the ray
+	vrm.beam_start = aim.position;
+	vrm.beam_end.x = aim.position.x + dir.x * VR_BEAM_MISS;
+	vrm.beam_end.y = aim.position.y + dir.y * VR_BEAM_MISS;
+	vrm.beam_end.z = aim.position.z + dir.z * VR_BEAM_MISS;
+	vrm.beam_hit = false;
+	vrm.beam_valid = true;
 
 	denom = VR_Dot( &dir, &normal );
 	if( denom > -0.0001f )
@@ -372,10 +410,28 @@ static qboolean VR_MenuPointer( float *px, float *py )
 	x = VR_Dot( &hit, &right );
 	y = VR_Dot( &hit, &up );
 
-	w = VR_MENU_METRES;
-	h = VR_MENU_METRES * VR_MENU_HEIGHT / VR_MENU_WIDTH;
 	*px = ( x / w + 0.5f ) * VR_MENU_WIDTH;
 	*py = ( 0.5f - y / h ) * VR_MENU_HEIGHT;
+
+	on = *px >= 0.0f && *px < VR_MENU_WIDTH && *py >= 0.0f && *py < VR_MENU_HEIGHT;
+	if( on )
+	{
+		vrm.beam_end.x = hit.x + vrm.pose.position.x;
+		vrm.beam_end.y = hit.y + vrm.pose.position.y;
+		vrm.beam_end.z = hit.z + vrm.pose.position.z;
+		vrm.beam_hit = true;
+	}
+	return true;
+}
+
+qboolean VR_MenuBeam( XrVector3f *start, XrVector3f *end, qboolean *hit )
+{
+	if( !vrm.open || !vrm.beam_valid )
+		return false;
+
+	*start = vrm.beam_start;
+	*end = vrm.beam_end;
+	*hit = vrm.beam_hit;
 	return true;
 }
 
@@ -706,6 +762,14 @@ void VR_MenuInfo( void )
 		vrm.hover >= 0 ? vr_menu_pages[vrm.page].items[vrm.hover].label : "nothing",
 		vrm.cursor_valid ? "on the panel at" : "off the panel, last", vrm.cursor_x, vrm.cursor_y, VR_MenuDim( ),
 		vrm.hold_fire ? ", holding fire until the trigger is let go" : "" );
+	if( vrm.open && vrm.beam_valid )
+		Con_Printf( "VR: laser beam from %.2f %.2f %.2f to %.2f %.2f %.2f (play space, m), %.2f m long, %s\n",
+			vrm.beam_start.x, vrm.beam_start.y, vrm.beam_start.z, vrm.beam_end.x, vrm.beam_end.y, vrm.beam_end.z,
+			sqrtf(( vrm.beam_end.x - vrm.beam_start.x ) * ( vrm.beam_end.x - vrm.beam_start.x )
+				+ ( vrm.beam_end.y - vrm.beam_start.y ) * ( vrm.beam_end.y - vrm.beam_start.y )
+				+ ( vrm.beam_end.z - vrm.beam_start.z ) * ( vrm.beam_end.z - vrm.beam_start.z )),
+			vrm.beam_hit ? "ends on the panel" : "misses the panel" );
+	else Con_Printf( "VR: no laser beam\n" );
 	Con_Printf( "VR: menu art: selection frame %s, slot numbers %s\n",
 		vrm.selection.sprite ? vrm.selection.sprite->name : "missing",
 		vrm.buckets[0].sprite ? vrm.buckets[0].sprite->name : "missing" );

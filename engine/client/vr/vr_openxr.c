@@ -269,6 +269,13 @@ static struct
 	uint32_t menu_num_images;
 	qboolean menu_drawn; // the menu's image holds this opening's menu
 
+	// the menu's laser beam in the world, this frame, see VR_DrawTransparent
+	qboolean beam_valid;
+	qboolean beam_hit; // ends on the panel
+	vec3_t   beam_start, beam_end;
+	qboolean in_eye_pass; // an eye is being drawn right now
+	vec3_t   eye_origin; // ... from here
+
 	uint32_t frames; // frames submitted since the session began
 	uint32_t frames_rendered; // ... of which the renderer drew the eyes
 	uint32_t frames_copied; // ... of which the eyes got the desktop copy
@@ -1613,6 +1620,99 @@ static void VR_EyeView( const ref_viewpass_t *rvp, const XrPosef *pose, const ve
 }
 
 /*
+VR_PlayToWorld
+
+A point in the play space (a controller, a spot on a panel) placed in
+the game the same way VR_EyeView places the eyes.
+*/
+static void VR_PlayToWorld( const ref_viewpass_t *rvp, const vec3_t head, const XrVector3f *pos, vec3_t out )
+{
+	float yaw = DEG2RAD( rvp->viewangles[YAW] );
+	vec3_t base, v, offset;
+
+	VR_PlayPosition( pos, v );
+	if( vr.space_type == XR_REFERENCE_SPACE_TYPE_STAGE )
+	{
+		VR_PlayerFeet( base );
+		base[0] += vr.room_gap[0];
+		base[1] += vr.room_gap[1];
+		v[0] -= head[0];
+		v[1] -= head[1];
+	}
+	else VectorCopy( rvp->vieworigin, base );
+
+	VR_YawVector( v, sinf( yaw ), cosf( yaw ), offset );
+	VectorAdd( base, offset, out );
+}
+
+/*
+VR_UpdateBeam
+
+The menu's laser beam for this frame, from the play space into the world.
+*/
+static void VR_UpdateBeam( const ref_viewpass_t *rvp, const vec3_t head )
+{
+	XrVector3f start, end;
+
+	vr.beam_valid = VR_MenuBeam( &start, &end, &vr.beam_hit );
+	if( !vr.beam_valid )
+		return;
+
+	VR_PlayToWorld( rvp, head, &start, vr.beam_start );
+	VR_PlayToWorld( rvp, head, &end, vr.beam_end );
+}
+
+#define VR_BEAM_WIDTH 0.2f // game units, about 5 mm
+
+/*
+VR_DrawTransparent
+
+The laser beam: a thin additive strip in the HUD's orange from the
+controller toward the panel, turned to face the eye being drawn. It's
+depth tested, so walls hide it, and the panel (a quad layer over the
+eyes) covers its end; the cross on the panel shows where it lands. A
+beam that misses fades out along its length.
+*/
+void VR_DrawTransparent( void )
+{
+	vec3_t dir, to_eye, side, a, b, c, d;
+	int white;
+
+	if( !vr.in_eye_pass || !vr.beam_valid )
+		return;
+
+	VectorSubtract( vr.beam_end, vr.beam_start, dir );
+	VectorSubtract( vr.eye_origin, vr.beam_start, to_eye );
+	CrossProduct( dir, to_eye, side );
+	if( VectorNormalizeLength( side ) < 0.0001f )
+		return; // looking straight down the beam
+
+	white = ref.dllFuncs.GL_FindTexture( REF_WHITE_TEXTURE );
+	if( !white )
+		return;
+
+	VectorScale( side, VR_BEAM_WIDTH * 0.5f, side );
+	VectorAdd( vr.beam_start, side, a );
+	VectorSubtract( vr.beam_start, side, b );
+	VectorSubtract( vr.beam_end, side, c );
+	VectorAdd( vr.beam_end, side, d );
+
+	ref.dllFuncs.GL_Bind( XASH_TEXTURE0, white );
+	ref.dllFuncs.TriRenderMode( kRenderTransAdd );
+	ref.dllFuncs.CullFace( TRI_NONE );
+	ref.dllFuncs.Begin( TRI_QUADS );
+	ref.dllFuncs.Color4ub( 255, 160, 0, 220 );
+	ref.dllFuncs.Vertex3fv( a );
+	ref.dllFuncs.Vertex3fv( b );
+	ref.dllFuncs.Color4ub( 255, 160, 0, vr.beam_hit ? 160 : 0 );
+	ref.dllFuncs.Vertex3fv( c );
+	ref.dllFuncs.Vertex3fv( d );
+	ref.dllFuncs.End( );
+	ref.dllFuncs.CullFace( TRI_FRONT );
+	ref.dllFuncs.TriRenderMode( kRenderNormal );
+}
+
+/*
 VR_FakeHandPose
 
 vr_debug_hands: a hand held level in front of the head, 20 cm to its side,
@@ -1646,6 +1746,37 @@ static void VR_FakeHandPose( int hand, XrPosef *out )
 	out->orientation.y = sinf( theta * 0.5f );
 	out->orientation.z = 0.0f;
 	out->orientation.w = cosf( theta * 0.5f );
+}
+
+/*
+VR_FakeAimPose
+
+vr_debug_hands "1 yaw pitch": the fake hand's aim, the right one turned by
+yaw around up, then pitch around the aim's own right axis (positive pitch
+tilts it up, OpenXR style)
+*/
+static void VR_FakeAimPose( int hand, float dyaw, float dpitch, XrPosef *out )
+{
+	XrQuaternionf qy, qp, t, q;
+
+	VR_FakeHandPose( hand, out );
+	if( hand != VR_HAND_RIGHT || ( !dyaw && !dpitch ))
+		return;
+
+	q = out->orientation;
+	qy.x = 0.0f; qy.y = sinf( DEG2RAD( dyaw ) * 0.5f ); qy.z = 0.0f; qy.w = cosf( DEG2RAD( dyaw ) * 0.5f );
+	qp.x = sinf( DEG2RAD( dpitch ) * 0.5f ); qp.y = 0.0f; qp.z = 0.0f; qp.w = cosf( DEG2RAD( dpitch ) * 0.5f );
+
+	// t = qy * q
+	t.w = qy.w * q.w - qy.x * q.x - qy.y * q.y - qy.z * q.z;
+	t.x = qy.w * q.x + qy.x * q.w + qy.y * q.z - qy.z * q.y;
+	t.y = qy.w * q.y - qy.x * q.z + qy.y * q.w + qy.z * q.x;
+	t.z = qy.w * q.z + qy.x * q.y - qy.y * q.x + qy.z * q.w;
+	// aim = t * qp (local pitch)
+	out->orientation.w = t.w * qp.w - t.x * qp.x - t.y * qp.y - t.z * qp.z;
+	out->orientation.x = t.w * qp.x + t.x * qp.w + t.y * qp.z - t.z * qp.y;
+	out->orientation.y = t.w * qp.y - t.x * qp.z + t.y * qp.w + t.z * qp.x;
+	out->orientation.z = t.w * qp.z + t.x * qp.y - t.y * qp.x + t.z * qp.w;
 }
 
 /*
@@ -2442,29 +2573,7 @@ static void VR_UpdateHands( const ref_viewpass_t *rvp, const vec3_t head )
 		if( VR_DebugHands( &dyaw, &dpitch ))
 		{
 			VR_FakeHandPose( hand, &grip );
-			aim = grip;
-
-			if( hand == VR_HAND_RIGHT && ( dyaw || dpitch ))
-			{
-				// turn the fake aim: yaw around up, then pitch around the
-				// aim's own right axis (positive pitch tilts it up, OpenXR style)
-				XrQuaternionf qy, qp, t;
-				const XrQuaternionf *q = &aim.orientation;
-
-				qy.x = 0.0f; qy.y = sinf( DEG2RAD( dyaw ) * 0.5f ); qy.z = 0.0f; qy.w = cosf( DEG2RAD( dyaw ) * 0.5f );
-				qp.x = sinf( DEG2RAD( dpitch ) * 0.5f ); qp.y = 0.0f; qp.z = 0.0f; qp.w = cosf( DEG2RAD( dpitch ) * 0.5f );
-
-				// t = qy * q
-				t.w = qy.w * q->w - qy.x * q->x - qy.y * q->y - qy.z * q->z;
-				t.x = qy.w * q->x + qy.x * q->w + qy.y * q->z - qy.z * q->y;
-				t.y = qy.w * q->y - qy.x * q->z + qy.y * q->w + qy.z * q->x;
-				t.z = qy.w * q->z + qy.x * q->y - qy.y * q->x + qy.z * q->w;
-				// aim = t * qp (local pitch)
-				aim.orientation.w = t.w * qp.w - t.x * qp.x - t.y * qp.y - t.z * qp.z;
-				aim.orientation.x = t.w * qp.x + t.x * qp.w + t.y * qp.z - t.z * qp.y;
-				aim.orientation.y = t.w * qp.y - t.x * qp.z + t.y * qp.w + t.z * qp.x;
-				aim.orientation.z = t.w * qp.z + t.x * qp.y - t.y * qp.x + t.z * qp.w;
-			}
+			VR_FakeAimPose( hand, dyaw, dpitch, &aim );
 		}
 		else if( !VR_GetHandPose( hand, VR_POSE_GRIP, vr.display_time, vr.space, &grip )
 			|| !VR_GetHandPose( hand, VR_POSE_AIM, vr.display_time, vr.space, &aim ))
@@ -2740,6 +2849,7 @@ static int VR_RenderEyesTimed( const ref_viewpass_t *rvp )
 	}
 	VR_UpdateHands( rvp, head ); // after the head center, the hands keep out of the head
 	VR_UpdateFlashlight( ); // from the hand just placed
+	VR_UpdateBeam( rvp, head );
 	{
 		// the head's place in the world, for the wall check
 		float yaw = DEG2RAD( rvp->viewangles[YAW] );
@@ -2810,7 +2920,11 @@ static int VR_RenderEyesTimed( const ref_viewpass_t *rvp )
 
 			VR_EyeView( rvp, &vr.views[eye].pose, head, eye_rvp.vieworigin, eye_rvp.viewangles );
 
+			// the laser beam is drawn in the eye passes only (VR_DrawTransparent)
+			VectorCopy( eye_rvp.vieworigin, vr.eye_origin );
+			vr.in_eye_pass = true;
 			GL_RenderFrame( &eye_rvp );
+			vr.in_eye_pass = false;
 
 			if( vr.samples )
 			{
@@ -3405,8 +3519,20 @@ static void VR_PlacePanel( void )
 
 qboolean VR_HandAimPose( int hand, XrPosef *out )
 {
+	float dyaw, dpitch;
+
 	if( !vr.running || !vr.display_time || vr.space == XR_NULL_HANDLE )
 		return false;
+
+	// vr_debug_hands: the same fake hands VR_UpdateHands draws
+	if( VR_DebugHands( &dyaw, &dpitch ))
+	{
+		if( !vr.views_valid )
+			return false;
+		VR_FakeAimPose( hand, dyaw, dpitch, out );
+		return true;
+	}
+
 	return VR_GetHandPose( hand, VR_POSE_AIM, vr.display_time, vr.space, out );
 }
 
